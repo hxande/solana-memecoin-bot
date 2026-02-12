@@ -12,7 +12,7 @@ export class SniperModule {
   private jupiter: JupiterSwap;
   private processedPools = new Set<string>();
   private lastSignature: string | undefined;
-  private pollInterval = 3000; // 3 seconds
+  private pollInterval = 3000;
 
   private filters = {
     minLiquiditySOL: 5, maxTopHolderPct: 30, requireMintRevoked: true,
@@ -32,9 +32,6 @@ export class SniperModule {
     this.pollRaydium();
   }
 
-  // ==========================================
-  // Polling — checks Raydium for new txs every 3s
-  // ==========================================
   private async pollRaydium() {
     const poll = async () => {
       try {
@@ -46,8 +43,6 @@ export class SniperModule {
 
         if (sigs.length > 0) {
           this.lastSignature = sigs[0].signature;
-
-          // Process oldest first
           for (const sig of sigs.reverse()) {
             if (this.processedPools.has(sig.signature)) continue;
             this.processedPools.add(sig.signature);
@@ -57,61 +52,54 @@ export class SniperModule {
       } catch (err: any) {
         console.error(`🎯 Poll error: ${err.message}`);
       }
-
       setTimeout(poll, this.pollInterval);
     };
-
     poll();
   }
 
-  // ==========================================
-  // Process a Raydium transaction
-  // ==========================================
   private async processTransaction(signature: string) {
     try {
       const tx = await connection.getParsedTransaction(signature, {
         maxSupportedTransactionVersion: 0,
       });
-
       if (!tx?.meta || tx.meta.err) return;
 
-      // Detect new token mints from post-token balances
-      // New pools create token accounts that didn't exist before
       const preTokens = new Set(
         (tx.meta.preTokenBalances || []).map((b: any) => b.mint)
       );
       const postTokens = (tx.meta.postTokenBalances || []).map((b: any) => b.mint);
-
-      // Find mints that appear in post but not in pre (new pool tokens)
       const newMints = postTokens.filter(
         (mint: string) => !preTokens.has(mint) && mint !== 'So11111111111111111111111111111111111111112'
       );
-
-      // Deduplicate
       const uniqueMints = [...new Set(newMints)];
 
       for (const mint of uniqueMints) {
         if (this.processedPools.has(mint)) continue;
         this.processedPools.add(mint);
-
-        console.log(`🆕 Raydium new pool: ${mint}`);
+        console.log(`\n🆕 Raydium new pool: ${mint}`);
         await this.evaluateAndBuy(mint);
       }
     } catch {}
   }
 
-  // ==========================================
-  // Evaluate token and buy if score is high
-  // ==========================================
   private async evaluateAndBuy(mint: string) {
     const tokenInfo = await this.analyzeToken(mint);
-    if (!tokenInfo) return;
-
-    const filterResult = this.applyFilters(tokenInfo);
-    if (!filterResult.passed) {
-      console.log(`  ❌ ${filterResult.reason}`);
+    if (!tokenInfo) {
+      console.log(`  ⚠️  Could not fetch token data — skipping`);
       return;
     }
+
+    // ── Detailed filter logging ──
+    console.log(`  📋 ${tokenInfo.symbol} (${tokenInfo.name})`);
+
+    const filterResult = this.applyFiltersWithLog(tokenInfo);
+
+    if (!filterResult.passed) {
+      console.log(`  🚫 BLOCKED — Score: ${filterResult.score}/100`);
+      return;
+    }
+
+    console.log(`  ✅ PASSED — Score: ${filterResult.score}/100`);
 
     const signal: TradeSignal = {
       type: 'SNIPE', action: 'BUY', mint,
@@ -121,22 +109,68 @@ export class SniperModule {
 
     await sendAlert(formatTradeAlert(signal));
 
-    if (signal.confidence >= 70) {
+    if (signal.confidence >= 50) {
+      console.log(`  💰 Executing buy: ${CONFIG.trading.maxBuySol} SOL...`);
       const tx = await this.jupiter.buy(mint, CONFIG.trading.maxBuySol);
       if (tx) {
+        console.log(`  ✅ BUY SUCCESS: https://solscan.io/tx/${tx}`);
         await sendAlert(`✅ Snipe executado!\nTX: https://solscan.io/tx/${tx}`);
         storage.addTrade({
           id: tx, time: Date.now(), action: 'BUY', mint,
           symbol: tokenInfo.symbol, amountSol: CONFIG.trading.maxBuySol,
           price: 0, tx, source: 'SNIPE',
         });
+      } else {
+        console.log(`  ❌ BUY FAILED (Jupiter error)`);
       }
+    } else {
+      console.log(`  ⏭️  Score ${filterResult.score} < 50 — alert only, no buy`);
     }
   }
 
   // ==========================================
-  // Token analysis
+  // Filters WITH detailed logging
   // ==========================================
+  private applyFiltersWithLog(token: TokenInfo): { passed: boolean; reason: string; score: number } {
+    let score = 50;
+    let passed = true;
+    let failReason = '';
+
+    // Liquidity
+    const liqOk = token.liquidity >= this.filters.minLiquiditySOL;
+    console.log(`  ${liqOk ? '✅' : '❌'} Liquidity: ${token.liquidity.toFixed(1)} SOL (min: ${this.filters.minLiquiditySOL})`);
+    if (!liqOk) { passed = false; failReason = 'Liquidez baixa'; }
+    else { score += Math.min(20, token.liquidity / 2); }
+
+    // Top holder
+    const holderOk = token.topHolderPct <= this.filters.maxTopHolderPct || token.topHolderPct === 0;
+    console.log(`  ${holderOk ? '✅' : '❌'} Top holder: ${token.topHolderPct.toFixed(1)}% (max: ${this.filters.maxTopHolderPct}%)`);
+    if (!holderOk && passed) { passed = false; failReason = `Top holder: ${token.topHolderPct}%`; }
+    else if (holderOk) { score += (30 - token.topHolderPct) / 2; }
+
+    // Mint authority
+    const mintOk = !this.filters.requireMintRevoked || !token.isMintable;
+    console.log(`  ${mintOk ? '✅' : '❌'} Mint renounced: ${token.isRenounced ? 'YES' : 'NO'}${this.filters.requireMintRevoked ? ' (required)' : ''}`);
+    if (!mintOk && passed) { passed = false; failReason = 'Mint não revogada'; }
+    if (token.isRenounced) score += 10;
+
+    // Holders
+    const holdersOk = token.holders >= this.filters.minHolders;
+    console.log(`  ${holdersOk ? '✅' : '❌'} Holders: ${token.holders} (min: ${this.filters.minHolders})`);
+    if (!holdersOk && passed) { passed = false; failReason = `Poucos holders: ${token.holders}`; }
+    else if (holdersOk) { score += Math.min(10, token.holders / 10); }
+
+    // LP Burned
+    console.log(`  ℹ️  LP burned: ${token.lpBurned ? 'YES' : 'UNKNOWN'}`);
+    console.log(`  ℹ️  Market cap: $${token.marketCap.toLocaleString()}`);
+
+    const finalScore = Math.min(100, Math.round(score));
+    console.log(`  🧮 Score: ${finalScore}/100`);
+
+    if (!passed) return { passed: false, reason: failReason, score: finalScore };
+    return { passed: true, reason: 'OK', score: finalScore };
+  }
+
   private async analyzeToken(mint: string): Promise<TokenInfo | null> {
     try {
       const [heliusData, birdeyeData] = await Promise.all([
@@ -144,82 +178,40 @@ export class SniperModule {
         this.getBirdeyeTokenData(mint),
       ]);
       return {
-        mint,
-        symbol: heliusData?.symbol || 'UNKNOWN',
-        name: heliusData?.name || 'Unknown',
-        decimals: heliusData?.decimals || 9,
-        poolAddress: '',
-        liquidity: birdeyeData?.liquidity || 0,
-        marketCap: birdeyeData?.mc || 0,
-        holders: birdeyeData?.holder || 0,
-        topHolderPct: await this.getTopHolderPct(mint),
-        createdAt: Date.now(),
+        mint, symbol: heliusData?.symbol || 'UNKNOWN',
+        name: heliusData?.name || 'Unknown', decimals: heliusData?.decimals || 9,
+        poolAddress: '', liquidity: birdeyeData?.liquidity || 0,
+        marketCap: birdeyeData?.mc || 0, holders: birdeyeData?.holder || 0,
+        topHolderPct: await this.getTopHolderPct(mint), createdAt: Date.now(),
         isRenounced: heliusData?.mintAuthority === null,
-        isMintable: heliusData?.mintAuthority !== null,
-        lpBurned: false,
+        isMintable: heliusData?.mintAuthority !== null, lpBurned: false,
       };
     } catch { return null; }
   }
 
-  // ==========================================
-  // Filters
-  // ==========================================
-  private applyFilters(token: TokenInfo): { passed: boolean; reason: string; score: number } {
-    let score = 50;
-
-    if (token.liquidity < this.filters.minLiquiditySOL)
-      return { passed: false, reason: 'Liquidez baixa', score: 0 };
-    score += Math.min(20, token.liquidity / 2);
-
-    if (token.topHolderPct > this.filters.maxTopHolderPct)
-      return { passed: false, reason: `Top holder: ${token.topHolderPct}%`, score: 0 };
-    score += (30 - token.topHolderPct) / 2;
-
-    if (this.filters.requireMintRevoked && token.isMintable)
-      return { passed: false, reason: 'Mint não revogada', score: 0 };
-    if (token.isRenounced) score += 10;
-
-    if (token.holders < this.filters.minHolders)
-      return { passed: false, reason: `Poucos holders: ${token.holders}`, score: 0 };
-    score += Math.min(10, token.holders / 10);
-
-    return { passed: true, reason: 'OK', score: Math.min(100, Math.round(score)) };
-  }
-
-  // ==========================================
-  // API calls
-  // ==========================================
   private async getHeliusTokenData(mint: string): Promise<any> {
     try {
-      const res = await fetch(
-        `https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`,
+      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`,
         { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mintAccounts: [mint] }) }
-      );
-      const data = (await res.json()) as any[];
+          body: JSON.stringify({ mintAccounts: [mint] }) });
+      const data: any = await res.json();
       return data[0]?.onChainAccountInfo?.accountInfo?.data?.parsed?.info || null;
     } catch { return null; }
   }
 
   private async getBirdeyeTokenData(mint: string): Promise<any> {
     try {
-      const res = await fetch(
-        `https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
-        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } }
-      );
-      const data = (await res.json()) as { data?: any };
-      return data.data || null;
+      const res: any = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
+        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
+      return (await res.json()).data || null;
     } catch { return null; }
   }
 
   private async getTopHolderPct(mint: string): Promise<number> {
     try {
-      const res = await fetch(
-        `https://public-api.birdeye.so/defi/token_holder?address=${mint}&limit=1`,
-        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } }
-      );
-      const data = (await res.json()) as { data?: { items?: { percentage?: number }[] } };
-      return data.data?.items?.[0]?.percentage || 0;
+      const res: any = await fetch(`https://public-api.birdeye.so/defi/token_holder?address=${mint}&limit=1`,
+        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
+      return (await res.json()).data?.items?.[0]?.percentage || 0;
     } catch { return 100; }
   }
 }
