@@ -1,0 +1,900 @@
+# 🤖 Solana Memecoin Trading Bot
+
+A fully automated trading bot for Solana memecoins. Snipes new tokens on Raydium and Pump.fun, copies smart money wallets, scores tokens with on-chain filters, tracks social sentiment, and manages positions with take-profit and stop-loss — all from a real-time web dashboard with Telegram alerts.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Modules](#modules)
+  - [Sniper (Raydium)](#1-sniper-raydium)
+  - [Pump.fun Sniper](#2-pumpfun-sniper)
+  - [Copy-Trading (Wallet Tracker)](#3-copy-trading-wallet-tracker)
+  - [Token Monitor (On-Chain Filters)](#4-token-monitor-on-chain-filters)
+  - [Social Sentiment](#5-social-sentiment)
+  - [Position Manager](#6-position-manager)
+  - [Backtester](#7-backtester)
+  - [Web Dashboard](#8-web-dashboard)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+  - [Environment Variables](#environment-variables)
+  - [API Keys Setup](#api-keys-setup)
+  - [Trading Parameters](#trading-parameters)
+- [Usage](#usage)
+  - [Running the Bot](#running-the-bot)
+  - [Running Individual Modules](#running-individual-modules)
+  - [Running Backtests](#running-backtests)
+- [Project Structure](#project-structure)
+- [API Reference (Dashboard)](#api-reference-dashboard)
+- [How Each Module Works](#how-each-module-works)
+- [Customization](#customization)
+  - [Adding Wallets to Track](#adding-wallets-to-track)
+  - [Adding Influencers](#adding-influencers)
+  - [Tuning Filters](#tuning-filters)
+  - [Creating Backtest Strategies](#creating-backtest-strategies)
+- [Safety and Risk Management](#safety-and-risk-management)
+- [Troubleshooting](#troubleshooting)
+- [Disclaimer](#disclaimer)
+
+---
+
+## Overview
+
+This bot combines six trading strategies into a single system:
+
+| Strategy | What it does | Speed |
+|----------|-------------|-------|
+| **Raydium Sniper** | Buys tokens within seconds of a new liquidity pool being created | ~1-3s |
+| **Pump.fun Sniper** | Monitors Pump.fun launches, bonding curve progress, and migration events | ~5-15s |
+| **Copy-Trading** | Mirrors trades from wallets you specify (smart money, whales, influencers) | ~2-5s |
+| **Token Monitor** | Scores trending tokens using on-chain data (safety, liquidity, holders, momentum) | Continuous |
+| **Social Sentiment** | Tracks Twitter/X mentions, influencer calls, DexScreener boosts, and emerging narratives | Continuous |
+| **Position Manager** | Monitors open positions and executes take-profit / stop-loss automatically | Every 10s |
+
+All signals are sent to **Telegram** in real time. The **web dashboard** at `http://localhost:3000` gives you a visual overview of everything.
+
+---
+
+## Architecture
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           Web Dashboard              │
+                    │       http://localhost:3000           │
+                    │  (positions, alerts, config, P&L)    │
+                    └──────────────┬──────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────────┐
+                    │           index.ts                    │
+                    │       (Module Orchestrator)           │
+                    └──┬───┬───┬───┬───┬───┬───┬──────────┘
+                       │   │   │   │   │   │   │
+          ┌────────────┘   │   │   │   │   │   └──────────────┐
+          ▼                ▼   │   ▼   │   ▼                  ▼
+    ┌──────────┐  ┌──────────┐│┌──────────┐│┌──────────┐ ┌──────────┐
+    │  Sniper  │  │ Pump.fun ││ │  Token   ││ │  Social  │ │ Backtest │
+    │ (Raydium)│  │  Sniper  ││ │ Monitor  ││ │Sentiment │ │  Engine  │
+    └────┬─────┘  └────┬─────┘│ └────┬─────┘│ └────┬─────┘ └──────────┘
+         │              │      │      │      │      │
+         │    ┌─────────┘      │      │      │      │
+         │    │   ┌────────────┘      │   ┌──┘      │
+         ▼    ▼   ▼                   ▼   ▼         │
+    ┌──────────────────┐    ┌──────────────────┐    │
+    │   Copy-Trading   │    │ Position Manager │    │
+    │ (Wallet Tracker) │    │  (TP / SL / PnL) │    │
+    └────────┬─────────┘    └────────┬─────────┘    │
+             │                       │              │
+             ▼                       ▼              │
+    ┌──────────────────────────────────────────┐    │
+    │              Jupiter Swap API             │    │
+    │       (Best price across all DEXs)       │    │
+    └────────────────┬─────────────────────────┘    │
+                     │                              │
+                     ▼                              │
+    ┌──────────────────────────────────────────┐    │
+    │            Solana Blockchain              │    │
+    │         (via Helius RPC + WebSocket)      │◄───┘
+    └──────────────────────────────────────────┘
+                     │
+                     ▼
+    ┌──────────────────────────────────────────┐
+    │            Telegram Alerts                │
+    │     (Real-time trade notifications)      │
+    └──────────────────────────────────────────┘
+```
+
+---
+
+## Modules
+
+### 1. Sniper (Raydium)
+
+**File:** `src/modules/sniper.ts`
+
+Monitors new liquidity pool creation on Raydium AMM via Helius Enhanced WebSocket. When a new pool is detected, it:
+
+1. Extracts the token mint address from the transaction
+2. Fetches token metadata from Helius and market data from Birdeye
+3. Runs the token through safety filters (anti-rug checks)
+4. Assigns a confidence score (0-100)
+5. If score ≥ 70, executes a buy via Jupiter
+
+**Safety filters applied:**
+- Minimum liquidity: 5 SOL
+- Maximum top holder concentration: 30%
+- Mint authority must be revoked
+- Freeze authority must be revoked
+- Minimum 10 holders
+- Token must be less than 5 minutes old
+- Developer address checked against blacklist
+
+**Key constants:**
+- `RAYDIUM_AMM`: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`
+- WebSocket: Helius Enhanced Transactions API
+
+---
+
+### 2. Pump.fun Sniper
+
+**File:** `src/modules/pumpfun.ts`
+
+Pump.fun is where most Solana memecoins launch. This module connects to the Pump.fun WebSocket (`wss://pumpportal.fun/api/data`) and REST API to monitor:
+
+**Four strategies:**
+
+| Strategy | Trigger | Description |
+|----------|---------|-------------|
+| `earlySnipe` | New token created | Waits 15s for initial trade data, then evaluates |
+| `bondingCurvePlay` | BC progress 70-95% | Buys tokens approaching Raydium migration |
+| `migrationSnipe` | BC progress 80-90 SOL | Buys right before the token migrates to Raydium |
+| `socialMomentum` | Volume surge detected | Buys when buy volume spikes 3x in 60 seconds |
+
+**Scoring criteria (max 100):**
+- Token age (< 5 min: +10)
+- Market cap range (5-30 SOL: +15)
+- Replies on Pump.fun (≥ 10: +15)
+- Number of buys (≥ 5: +10)
+- Unique traders (≥ 3: +10)
+- Buy/sell ratio (≥ 3:1: +15)
+- Creator holdings (< 10%: +10)
+- Bonding curve progress (60-85%: +15)
+
+**Anti-rug checks:**
+- Excluded keywords in name/description: `rug`, `scam`, `test`, `airdrop`
+- Blacklisted creators (auto-blacklists serial deployers with 5+ tokens)
+- Creator holding percentage check
+
+**Bonding curve mechanics:**
+- Pump.fun tokens start on a bonding curve
+- When ~85 SOL of market cap is reached, liquidity migrates to Raydium
+- This migration often causes a significant price pump
+- The bot can buy just before migration for this play
+
+---
+
+### 3. Copy-Trading (Wallet Tracker)
+
+**File:** `src/modules/walletTracker.ts`
+
+Monitors specified wallet addresses for swap transactions. When a tracked wallet buys a token, the bot copies the trade proportionally.
+
+**How it works:**
+1. Polls `getSignaturesForAddress` every 2 seconds per wallet
+2. Fetches and parses each transaction
+3. Compares pre/post token balances to detect swaps
+4. If a buy is detected and exceeds the minimum threshold, copies it
+
+**Configuration per wallet:**
+```typescript
+{
+  address: 'WALLET_ADDRESS',  // Solana public key
+  label: 'Smart Money #1',    // Your label for this wallet
+  copyPct: 50,                // Copy 50% of their trade size
+  minTradeSol: 0.5,           // Ignore trades smaller than 0.5 SOL
+  enabled: true               // Toggle on/off
+}
+```
+
+**How to find wallets to track:**
+- Use [Birdeye](https://birdeye.so) or [Solscan](https://solscan.io) to find profitable wallets
+- Look at early buyers of tokens that did 10x+
+- Check influencer wallets (many are public)
+- Use [GMGN](https://gmgn.ai) or [Cielo](https://cielo.finance) for smart money tracking
+
+---
+
+### 4. Token Monitor (On-Chain Filters)
+
+**File:** `src/modules/tokenMonitor.ts`
+
+Continuously scores trending tokens from Birdeye using four categories:
+
+**Scoring breakdown:**
+
+| Category | Max Score | What it checks |
+|----------|-----------|---------------|
+| **Safety** | 30 | Mint renounced (+10), not mintable (+5), LP burned (+10), top holder < 10% (+5) |
+| **Liquidity** | 25 | Liquidity ≥ $100k (+10), good liquidity/mcap ratio (+10), low mcap < $1M (+5) |
+| **Community** | 25 | Holders ≥ 500 (+15), ≥ 100 (+10), ≥ 30 (+5), plus growth rate (+10) |
+| **Momentum** | 20 | Positive 1h price change (+10), volume increasing > 50% (+10) |
+
+Tokens scoring ≥ 60/100 trigger a Telegram alert with full breakdown.
+
+---
+
+### 5. Social Sentiment
+
+**File:** `src/modules/socialSentiment.ts`
+
+Tracks social media activity to detect hype before price movement.
+
+**Data sources:**
+- **Twitter/X API** (if bearer token provided): Polls influencer tweets and token mentions
+- **DexScreener Boosts API** (free, no key needed): Tracks boosted/promoted tokens
+- **Birdeye Social Score**: Token-level social scoring
+
+**Three detection systems:**
+
+**A) Influencer Call Detection**
+- Monitors tweets from configured influencer accounts
+- Extracts Solana mint addresses and ticker symbols ($SYMBOL) from tweet text
+- Analyzes sentiment using keyword matching and emoji analysis
+- Alerts when a high-weight influencer (≥ 7/10) posts a bullish call
+
+**B) Narrative Detection**
+- Aggregates all mentions from the last hour
+- Counts frequency of narrative keywords: `ai`, `agent`, `cat`, `dog`, `trump`, `elon`, `pepe`, etc.
+- Detects when a new narrative emerges (≥ 5 mentions in an hour)
+- Tracks narrative growth rate over time
+
+**C) Trend Velocity Analysis**
+- For each tracked token, compares mentions in the last 30 min vs. previous 30 min
+- Alerts when velocity ≥ 3x and ≥ 70% of mentions are bullish
+
+**Sentiment analysis:**
+- Bullish keywords: `moon`, `gem`, `100x`, `lfg`, `alpha`, `pump`, etc.
+- Bearish keywords: `rug`, `scam`, `dump`, `dead`, `avoid`, etc.
+- Bullish emojis: 🚀🔥💎🌙💰📈
+- Bearish emojis: 💀🔴📉⚠️
+
+---
+
+### 6. Position Manager
+
+**File:** `src/modules/positionManager.ts`
+
+Monitors all open positions every 10 seconds and enforces exit rules.
+
+**Exit triggers:**
+- **Take Profit**: Sells when position reaches the configured profit target (default: +100%)
+- **Stop Loss**: Sells when position drops below the configured loss limit (default: -50%)
+
+**How it works:**
+1. Loops through all open positions
+2. Fetches current price from Birdeye
+3. Calculates unrealized P&L
+4. Sends Telegram alert and executes sell if TP or SL is hit
+
+---
+
+### 7. Backtester
+
+**File:** `src/modules/backtester.ts`
+
+Tests trading strategies against historical data before risking real money.
+
+**Data collection:**
+- Fetches historical token data from Birdeye token list API
+- Stores mint, launch price, peak price, ATH multiple, liquidity, holders, and rug status
+- Saves data to `data/backtest/` as JSON files
+
+**Simulation:**
+1. Filters tokens using strategy filters
+2. Checks entry rules (score threshold, volume spike, bonding curve completion)
+3. Simulates trade execution with entry/exit prices
+4. Applies exit rules (take profit, stop loss, trailing stop, time-based exit)
+5. Calculates P&L per trade and portfolio metrics
+
+**Output metrics:**
+- Total P&L (SOL and %)
+- Win rate
+- Profit factor (gross profit / gross loss)
+- Sharpe ratio
+- Maximum drawdown
+- Average hold time
+- Number of rugs prevented by filters
+- Equity curve
+- Best and worst trade
+
+**Pre-built strategies:**
+
+| Strategy | Min Liquidity | Max Top Holder | TP | SL | Style |
+|----------|--------------|----------------|-----|-----|-------|
+| Conservative | $5,000 | 15% | 50% | 25% | Safe, fewer trades |
+| Aggressive | $1,000 | 30% | 200% | 50% | Risky, more trades |
+
+---
+
+### 8. Web Dashboard
+
+**File:** `src/dashboard/server.ts`
+
+Express + WebSocket server serving a real-time single-page dashboard.
+
+**Features:**
+- Live wallet balance display
+- Module status indicators (ON/OFF for each module)
+- Open positions table with real-time P&L
+- Live alerts feed (WebSocket-powered, no refresh needed)
+- Trading configuration editor (max buy, slippage, TP, SL)
+- Tracked wallets list with add/remove
+- Active narratives display from Social Sentiment module
+- Pump.fun and Social module statistics
+
+**Endpoints:** See [API Reference](#api-reference-dashboard).
+
+---
+
+## Prerequisites
+
+- **Node.js** v18 or higher
+- **npm** or **yarn**
+- A **Solana wallet** with SOL (start with a small amount for testing)
+- **API keys** (see [API Keys Setup](#api-keys-setup))
+
+---
+
+## Installation
+
+### Option A: Using the setup scripts
+
+```bash
+# Download and run the two setup scripts
+chmod +x setup.sh setup-part2.sh
+./setup.sh
+./setup-part2.sh
+
+# Enter the project directory
+cd solana-memecoin-bot
+
+# Configure your API keys
+nano .env
+
+# Install dependencies
+npm install
+```
+
+### Option B: Manual setup
+
+```bash
+# Create the project
+mkdir solana-memecoin-bot && cd solana-memecoin-bot
+mkdir -p src/{core,modules,dashboard/public,scripts} data/backtest
+
+# Initialize and install
+npm init -y
+npm install @solana/web3.js @solana/spl-token bs58 axios dotenv ws telegraf express cors
+npm install -D typescript ts-node ts-node-dev @types/node @types/ws @types/express @types/cors
+
+# Copy all source files from the setup scripts into their respective locations
+# Then configure your .env file
+```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+Copy the `.env` file and fill in your values:
+
+```env
+# Solana RPC (Helius recommended)
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+
+# Your bot's wallet private key (base58 encoded)
+PRIVATE_KEY=your_base58_private_key
+
+# API Keys
+HELIUS_API_KEY=your_helius_key
+BIRDEYE_API_KEY=your_birdeye_key
+JUPITER_API=https://quote-api.jup.ag/v6
+
+# Telegram
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+# Twitter (optional)
+TWITTER_BEARER_TOKEN=your_bearer_token
+
+# Trading
+MAX_BUY_SOL=0.1
+SLIPPAGE_BPS=500
+AUTO_SELL_PROFIT_PCT=100
+STOP_LOSS_PCT=50
+GAS_PRIORITY_FEE=0.005
+
+# Dashboard
+DASHBOARD_PORT=3000
+```
+
+### API Keys Setup
+
+#### Helius (Required)
+
+Helius provides the Solana RPC, WebSocket, and token metadata API.
+
+1. Go to [https://helius.dev](https://helius.dev)
+2. Create a free account
+3. Copy your API key
+4. Free tier: 100,000 requests/day — sufficient for this bot
+
+#### Birdeye (Required)
+
+Birdeye provides token market data, pricing, holder info, and trending lists.
+
+1. Go to [https://birdeye.so](https://birdeye.so)
+2. Navigate to the developer section
+3. Create an API key
+4. Free tier: 100 requests/minute
+
+#### Telegram Bot (Recommended)
+
+1. Open Telegram and search for `@BotFather`
+2. Send `/newbot` and follow the prompts
+3. Copy the bot token
+4. Send any message to your new bot
+5. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
+6. Find `chat.id` in the response — that is your `TELEGRAM_CHAT_ID`
+
+#### Twitter/X (Optional)
+
+Without this key, the bot still works using DexScreener boosts and Birdeye social data as alternatives.
+
+1. Go to [https://developer.twitter.com](https://developer.twitter.com)
+2. Create a project and app
+3. Generate a Bearer Token
+4. Free tier: 500,000 tweets/month read access
+
+### Trading Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MAX_BUY_SOL` | 0.1 | Maximum SOL spent per trade |
+| `SLIPPAGE_BPS` | 500 | Slippage tolerance in basis points (500 = 5%) |
+| `AUTO_SELL_PROFIT_PCT` | 100 | Take profit at +100% gain |
+| `STOP_LOSS_PCT` | 50 | Stop loss at -50% |
+| `GAS_PRIORITY_FEE` | 0.005 | Priority fee in SOL for faster transactions |
+
+> **Tip:** Start with `MAX_BUY_SOL=0.01` for testing. Increase only after verifying the bot works correctly with your filters.
+
+---
+
+## Usage
+
+### Running the Bot
+
+```bash
+# Start all modules
+npm start
+
+# Start with auto-restart on file changes (development)
+npm run dev
+```
+
+On startup, the bot will:
+1. Print your wallet address and balance
+2. Start all six trading modules
+3. Start the web dashboard
+4. Send a Telegram notification confirming it is running
+
+### Running Individual Modules
+
+```bash
+# Only the Raydium sniper
+npm run sniper
+
+# Only the wallet tracker (copy-trading)
+npm run tracker
+
+# Only the token monitor (on-chain filters)
+npm run monitor
+```
+
+### Running Backtests
+
+```bash
+# Collect historical data and run all default strategies
+npm run backtest
+```
+
+This will:
+1. Fetch the last 30 days of token data from Birdeye
+2. Run the Conservative strategy simulation
+3. Run the Aggressive strategy simulation
+4. Print a report for each with win rate, P&L, Sharpe ratio, etc.
+5. Save results to `data/backtest/`
+
+---
+
+## Project Structure
+
+```
+solana-memecoin-bot/
+│
+├── .env                          # API keys and configuration
+├── .gitignore                    # Excludes node_modules, .env, data/
+├── package.json                  # Dependencies and scripts
+├── tsconfig.json                 # TypeScript configuration
+├── README.md                     # This file
+│
+├── data/
+│   └── backtest/                 # Historical data and backtest results
+│
+└── src/
+    ├── index.ts                  # Main entry point, starts all modules
+    ├── config.ts                 # Loads .env into typed CONFIG object
+    ├── types.ts                  # Shared TypeScript interfaces
+    │
+    ├── core/
+    │   ├── connection.ts         # Solana RPC connection + wallet keypair
+    │   ├── jupiter.ts            # Jupiter Aggregator swap (buy/sell)
+    │   └── alerts.ts             # Telegram alert formatting and sending
+    │
+    ├── modules/
+    │   ├── sniper.ts             # Raydium new pool sniper
+    │   ├── pumpfun.ts            # Pump.fun token sniper
+    │   ├── walletTracker.ts      # Copy-trading / wallet monitoring
+    │   ├── tokenMonitor.ts       # On-chain token scoring
+    │   ├── socialSentiment.ts    # Twitter/social monitoring
+    │   ├── positionManager.ts    # Take-profit / stop-loss manager
+    │   └── backtester.ts         # Strategy backtesting engine
+    │
+    ├── dashboard/
+    │   └── server.ts             # Express + WebSocket dashboard server
+    │
+    └── scripts/
+        └── runBacktest.ts        # Standalone backtest runner
+```
+
+---
+
+## API Reference (Dashboard)
+
+The dashboard exposes a REST API on the configured port (default: 3000).
+
+### GET `/api/status`
+
+Returns bot status, wallet balance, active modules, and current config.
+
+```json
+{
+  "status": "running",
+  "wallet": "YourPublicKey...",
+  "balanceSol": 1.5432,
+  "uptime": 3600,
+  "modules": {
+    "sniper": true,
+    "tracker": true,
+    "monitor": true,
+    "pumpfun": true,
+    "social": true
+  },
+  "config": {
+    "maxBuySol": 0.1,
+    "slippageBps": 500,
+    "profitTarget": 100,
+    "stopLoss": 50
+  }
+}
+```
+
+### GET `/api/positions`
+
+Returns all open positions with current P&L.
+
+### GET `/api/trades`
+
+Returns the last 100 executed trades.
+
+### GET `/api/alerts`
+
+Returns the last 50 alerts.
+
+### GET `/api/wallets`
+
+Returns all tracked wallets and their configuration.
+
+### POST `/api/wallets`
+
+Add a new wallet to track.
+
+```json
+{
+  "address": "WalletPublicKey...",
+  "label": "My Whale",
+  "copyPct": 50,
+  "minTradeSol": 0.5
+}
+```
+
+### POST `/api/config`
+
+Update trading parameters at runtime (no restart needed).
+
+```json
+{
+  "maxBuySol": 0.2,
+  "slippageBps": 300,
+  "profitTarget": 150,
+  "stopLoss": 40
+}
+```
+
+### GET `/api/pumpfun/stats`
+
+Returns Pump.fun module statistics (tokens processed, trades tracked, etc.).
+
+### GET `/api/social/stats`
+
+Returns social sentiment statistics and active narratives.
+
+### WebSocket
+
+Connect to `ws://localhost:3000` for real-time events:
+
+```json
+{ "type": "alert", "data": { "time": 1234567890, "type": "snipe", "message": "..." } }
+{ "type": "trade", "data": { "action": "BUY", "mint": "...", "amount": 0.1 } }
+{ "type": "performance", "data": { "time": 1234567890, "balanceSol": 1.54 } }
+```
+
+---
+
+## How Each Module Works
+
+### Trade Execution Flow
+
+```
+Signal Detected (any module)
+        │
+        ▼
+┌─────────────────┐
+│ Apply Filters   │──── FAIL ──── Log & skip
+│ (safety checks) │
+└────────┬────────┘
+         │ PASS
+         ▼
+┌─────────────────┐
+│ Calculate Score  │──── < threshold ──── Alert only (no buy)
+│ (0-100)          │
+└────────┬────────┘
+         │ ≥ threshold
+         ▼
+┌─────────────────┐
+│ Get Jupiter Quote│
+│ (best price)     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Build & Sign TX  │
+│ (VersionedTx)    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Send to Solana   │
+│ (skipPreflight)  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Telegram Alert   │
+│ + Dashboard WS   │
+└─────────────────┘
+```
+
+### Jupiter Swap
+
+All trades go through Jupiter Aggregator (`https://quote-api.jup.ag/v6`), which:
+- Finds the best price across all Solana DEXs (Raydium, Orca, Meteora, etc.)
+- Handles WSOL wrapping/unwrapping automatically
+- Supports versioned transactions for compute efficiency
+- Applies configurable slippage and priority fees
+
+---
+
+## Customization
+
+### Adding Wallets to Track
+
+Edit the `trackedWallets` array in `src/modules/walletTracker.ts`:
+
+```typescript
+private trackedWallets: WalletConfig[] = [
+  {
+    address: 'RealWalletAddressHere',
+    label: 'Top Trader',
+    copyPct: 50,        // Copy 50% of their trade size
+    minTradeSol: 0.5,   // Ignore trades under 0.5 SOL
+    enabled: true,
+  },
+];
+```
+
+Or add wallets at runtime via the dashboard API:
+
+```bash
+curl -X POST http://localhost:3000/api/wallets \
+  -H "Content-Type: application/json" \
+  -d '{"address": "...", "label": "Whale", "copyPct": 30, "minTradeSol": 1}'
+```
+
+### Adding Influencers
+
+Edit the `influencers` array in `src/modules/socialSentiment.ts`:
+
+```typescript
+private influencers: InfluencerConfig[] = [
+  {
+    handle: 'twitter_handle',   // Without the @
+    platform: 'twitter',
+    followers: 50000,
+    weight: 8,                  // 1-10 importance
+    trackBuyCalls: true,
+  },
+];
+```
+
+### Tuning Filters
+
+#### Sniper filters (`src/modules/sniper.ts`):
+
+```typescript
+private filters = {
+  minLiquiditySOL: 5,          // Increase for safer trades
+  maxTopHolderPct: 30,         // Lower = safer but fewer trades
+  requireMintRevoked: true,    // Set false for more trades (riskier)
+  requireFreezeRevoked: true,
+  minHolders: 10,              // Increase to avoid very early tokens
+  maxAgeSeconds: 300,          // Decrease to only snipe very new tokens
+};
+```
+
+#### Pump.fun filters (`src/modules/pumpfun.ts`):
+
+```typescript
+private filters = {
+  minReplies: 3,               // Pump.fun comment count
+  minMarketCapSOL: 2,          // Minimum to avoid dust
+  maxMarketCapSOL: 100,        // Maximum to buy early
+  minBuyCount: 5,              // Minimum buy transactions
+  maxCreatorHoldPct: 30,       // Creator max holdings
+  minUniqueTraders: 3,         // Avoid wash trading
+  maxAgeMinutes: 30,           // Only recent tokens
+  excludedKeywords: ['rug', 'scam', 'test'],
+};
+```
+
+### Creating Backtest Strategies
+
+```typescript
+const myStrategy: BacktestStrategy = {
+  name: 'My Custom Strategy',
+  filters: {
+    minLiquidity: 3000,
+    maxTopHolderPct: 20,
+    requireMintRenounced: true,
+    requireLpBurned: false,
+    minHolders: 30,
+    maxAgeMinutes: 45,
+    minScore: 65,
+  },
+  entryRules: [
+    { type: 'score_threshold', params: { min: 65 } },
+    { type: 'volume_spike', params: { minVolumeUSD: 15000 } },
+  ],
+  exitRules: [
+    { type: 'take_profit', params: { pct: 150 } },
+    { type: 'stop_loss', params: { pct: 35 } },
+    { type: 'trailing_stop', params: { pct: 25 } },
+    { type: 'time_based', params: { maxHours: 8 } },
+  ],
+};
+```
+
+---
+
+## Safety and Risk Management
+
+### Critical Security Rules
+
+1. **Never share your private key.** The `.env` file contains your wallet's private key. Never commit it to git, share it, or expose it.
+
+2. **Use a dedicated wallet.** Create a new wallet specifically for this bot. Do not use your main wallet.
+
+3. **Start small.** Set `MAX_BUY_SOL=0.01` initially. Only increase after extensive testing.
+
+4. **Run backtests first.** Before trading real money, run the backtester to validate your filter settings.
+
+5. **Monitor constantly at first.** Watch the Telegram alerts and dashboard closely during the first few days.
+
+6. **The `.env` file must be in `.gitignore`.** This is already configured, but double-check before pushing to any repository.
+
+### What the Filters Protect Against
+
+| Risk | Protection |
+|------|-----------|
+| **Rug pulls** | Mint authority check, LP burn check, holder concentration |
+| **Honeypots** | Slippage limits, sell simulation (via Jupiter) |
+| **Wash trading** | Unique trader count, buy/sell ratio analysis |
+| **Serial scammers** | Creator history tracking, auto-blacklisting |
+| **Low liquidity** | Minimum liquidity filters, liquidity/mcap ratio |
+
+### What the Filters Cannot Protect Against
+
+- Tokens that pass all filters but still go to zero (most memecoins do)
+- Coordinated pump-and-dump schemes with sophisticated execution
+- Smart contract exploits in novel token designs
+- Sudden liquidity removal after passing initial checks
+- Market-wide crashes affecting all tokens simultaneously
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**"Connection refused" on WebSocket**
+- Check that your Helius API key is valid
+- Verify the WebSocket URL format: `wss://mainnet.helius-rpc.com/?api-key=KEY`
+- Helius free tier has rate limits — you may be temporarily blocked
+
+**"Buy failed" errors**
+- Insufficient SOL balance (need SOL for both the trade and gas fees)
+- Slippage too low — increase `SLIPPAGE_BPS` (try 1000 for volatile tokens)
+- Token may have trading restrictions (honeypot)
+- Jupiter route may not exist yet for very new tokens
+
+**"Telegram error"**
+- Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are correct
+- Make sure you sent at least one message to the bot before starting
+- Check that the bot token has not been revoked
+
+**"Rate limited" on Birdeye**
+- Free tier: 100 requests/minute
+- The bot makes many requests — consider a paid plan for heavy usage
+- Or increase polling intervals in the modules
+
+**Dashboard not loading**
+- Check if port 3000 is available: `lsof -i :3000`
+- Change the port in `.env` with `DASHBOARD_PORT=3001`
+
+**TypeScript compilation errors**
+- Run `npx tsc --noEmit` to check for type errors
+- Make sure all dependencies are installed: `npm install`
+
+---
+
+## Disclaimer
+
+**This software is provided for educational and research purposes only.**
+
+- Memecoin trading is extremely high-risk. The vast majority of memecoins go to zero.
+- Past performance (including backtests) does not guarantee future results.
+- Never invest more than you can afford to lose completely.
+- This bot does not constitute financial advice.
+- You are solely responsible for any trades executed by this bot.
+- The authors are not liable for any financial losses.
+- Always do your own research before trading.
+
+---
+
+## License
+
+MIT
