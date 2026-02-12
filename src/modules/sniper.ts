@@ -23,23 +23,59 @@ export class SniperModule {
       console.log(`🎯 Loaded ${this.filters.blacklistedDevs.size} blacklisted devs`);
   }
 
-  async start() { console.log('🎯 Sniper Module started'); this.connectWebSocket(); }
+  async start() {
+    console.log('🎯 Sniper Module started');
+    this.connectWebSocket();
+  }
 
   private connectWebSocket() {
+    // Skip if no valid API key
+    if (!CONFIG.heliusKey || CONFIG.heliusKey.includes('YOUR_') || CONFIG.heliusKey === 'your_helius_api_key') {
+      console.log('⚠️  Sniper WS: No valid HELIUS_API_KEY — skipping WebSocket (Sniper will not detect new pools)');
+      return;
+    }
+
     const wsUrl = `wss://atlas-mainnet.helius-rpc.com/?api-key=${CONFIG.heliusKey}`;
-    this.ws = new WebSocket(wsUrl);
+
+    try {
+      this.ws = new WebSocket(wsUrl);
+    } catch (err: any) {
+      console.error(`🔌 Sniper WS create error: ${err.message}`);
+      setTimeout(() => this.connectWebSocket(), 10000);
+      return;
+    }
+
     this.ws.on('open', () => {
       console.log('🔌 Sniper WS connected');
       this.ws!.send(JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'transactionSubscribe',
-        params: [{ accountInclude: ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'], type: 'SWAP' },
-        { commitment: 'confirmed', encoding: 'jsonParsed', transactionDetails: 'full', maxSupportedTransactionVersion: 0 }],
+        params: [{
+          accountInclude: ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8'],
+          type: 'SWAP',
+        }, {
+          commitment: 'confirmed', encoding: 'jsonParsed',
+          transactionDetails: 'full', maxSupportedTransactionVersion: 0,
+        }],
       }));
     });
+
     this.ws.on('message', async (data) => {
-      try { const msg = JSON.parse(data.toString()); if (msg.params?.result) await this.processNewPool(msg.params.result); } catch {}
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.params?.result) await this.processNewPool(msg.params.result);
+      } catch {}
     });
-    this.ws.on('close', () => { setTimeout(() => this.connectWebSocket(), 3000); });
+
+    this.ws.on('error', (err) => {
+      console.error(`🔌 Sniper WS error: ${err.message}`);
+      // Don't crash — the 'close' event will handle reconnection
+    });
+
+    this.ws.on('close', (code) => {
+      console.log(`🔌 Sniper WS closed (code: ${code}), reconnecting in 10s...`);
+      this.ws = null;
+      setTimeout(() => this.connectWebSocket(), 10000);
+    });
   }
 
   private async processNewPool(txData: any) {
@@ -92,15 +128,19 @@ export class SniperModule {
   private extractMintFromTx(txData: any): string | null { try { return txData.transaction?.message?.accountKeys?.[1]?.pubkey || null; } catch { return null; } }
 
   private async getHeliusTokenData(mint: string): Promise<any> {
-    const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mintAccounts: [mint] }) });
-    const data = await res.json() as any[];
-    return data[0]?.onChainAccountInfo?.accountInfo?.data?.parsed?.info || null;
+    try {
+      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mintAccounts: [mint] }) });
+      const data = await res.json() as any[];
+      return data[0]?.onChainAccountInfo?.accountInfo?.data?.parsed?.info || null;
+    } catch { return null; }
   }
 
   private async getBirdeyeTokenData(mint: string): Promise<any> {
-    const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`, { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
-    const data = await res.json() as { data?: any };
-    return data.data || null;
+    try {
+      const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`, { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
+      const data = await res.json() as { data?: any };
+      return data.data || null;
+    } catch { return null; }
   }
 
   private async getTopHolderPct(mint: string): Promise<number> {

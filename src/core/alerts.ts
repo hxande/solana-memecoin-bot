@@ -2,16 +2,34 @@ import { Telegraf } from 'telegraf';
 import { CONFIG } from '../config';
 import { TradeSignal, Position } from '../types';
 
-const bot = new Telegraf(CONFIG.telegram.token);
+let bot: Telegraf | null = null;
+
+// Only init Telegram if token is configured
+if (CONFIG.telegram.token && !CONFIG.telegram.token.includes('your_')) {
+  try {
+    bot = new Telegraf(CONFIG.telegram.token);
+  } catch (err: any) {
+    console.error(`⚠️  Telegram init failed: ${err.message}`);
+  }
+} else {
+  console.log('⚠️  Telegram not configured — alerts will only show in console/dashboard');
+}
 
 export async function sendAlert(msg: string) {
+  // Always log to console (strip HTML tags for readability)
+  const clean = msg.replace(/<[^>]*>/g, '');
+  console.log(`📢 ${clean.split('\n')[0]}`);
+
+  if (!bot || !CONFIG.telegram.chatId || CONFIG.telegram.chatId.includes('your_')) return;
+
   try {
     await bot.telegram.sendMessage(CONFIG.telegram.chatId, msg, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
     });
   } catch (err: any) {
-    console.error(`Telegram error: ${err.message}`);
+    // Don't crash on Telegram errors, just log
+    console.error(`⚠️  Telegram send failed: ${err.message}`);
   }
 }
 
