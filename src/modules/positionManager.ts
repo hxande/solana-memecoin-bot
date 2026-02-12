@@ -1,6 +1,7 @@
 import { connection, wallet } from '../core/connection';
 import { JupiterSwap } from '../core/jupiter';
 import { sendAlert, formatPositionUpdate } from '../core/alerts';
+import { storage } from '../core/storage';
 import { CONFIG } from '../config';
 import { Position } from '../types';
 
@@ -10,11 +11,15 @@ export class PositionManager {
 
   constructor() {
     this.jupiter = new JupiterSwap(connection, wallet);
+    const saved = storage.loadPositions();
+    for (const pos of saved) this.positions.set(pos.mint, pos);
+    if (saved.length > 0) console.log(`📌 Loaded ${saved.length} positions from disk`);
   }
 
   addPosition(pos: Position) {
     this.positions.set(pos.mint, pos);
-    console.log(`📌 Position added: ${pos.symbol} @ $${pos.entryPrice}`);
+    storage.addPosition(pos);
+    console.log(`📌 Position saved: ${pos.symbol} @ $${pos.entryPrice}`);
   }
 
   async startMonitoring() {
@@ -28,21 +33,37 @@ export class PositionManager {
           const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
           if (pnlPct >= CONFIG.trading.profitTarget) {
-            console.log(`🎯 Take profit: ${pos.symbol} +${pnlPct.toFixed(1)}%`);
             await sendAlert(`🎯 <b>TAKE PROFIT</b>\n${formatPositionUpdate(pos, currentPrice)}`);
-          }
-          if (pnlPct <= -CONFIG.trading.stopLoss) {
-            console.log(`🛑 Stop loss: ${pos.symbol} ${pnlPct.toFixed(1)}%`);
+            await this.closePosition(mint, currentPrice, `TP +${pnlPct.toFixed(1)}%`);
+          } else if (pnlPct <= -CONFIG.trading.stopLoss) {
             await sendAlert(`🛑 <b>STOP LOSS</b>\n${formatPositionUpdate(pos, currentPrice)}`);
+            await this.closePosition(mint, currentPrice, `SL ${pnlPct.toFixed(1)}%`);
           }
         } catch {}
       }
+      // Persist updated prices
+      storage.savePositions(Array.from(this.positions.values()));
       setTimeout(monitor, 10000);
     };
     monitor();
   }
 
-  getPositions(): Position[] {
-    return Array.from(this.positions.values());
+  private async closePosition(mint: string, exitPrice: number, reason: string) {
+    const pos = this.positions.get(mint);
+    if (!pos) return;
+    const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const pnlSol = pos.amount * (pnlPct / 100);
+
+    storage.addTrade({
+      id: `sell_${mint}_${Date.now()}`, time: Date.now(), action: 'SELL',
+      mint, symbol: pos.symbol, amountSol: pos.amount, price: exitPrice,
+      tx: null, source: pos.source, pnlPct, pnlSol,
+    });
+
+    this.positions.delete(mint);
+    storage.removePosition(mint);
+    console.log(`📤 Closed: ${pos.symbol} | ${reason} | PnL: ${pnlPct.toFixed(1)}%`);
   }
+
+  getPositions(): Position[] { return Array.from(this.positions.values()); }
 }

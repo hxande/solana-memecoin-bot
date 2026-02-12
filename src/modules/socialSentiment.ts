@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { CONFIG } from '../config';
+import { storage } from '../core/storage';
 import { sendAlert } from '../core/alerts';
 import { TradeSignal } from '../types';
 
@@ -33,10 +34,21 @@ export class SocialSentimentModule {
   private processedTweetIds = new Set<string>();
   private activeNarratives = new Map<string, { keywords: string[]; score: number; startedAt: number }>();
 
-  private influencers: InfluencerConfig[] = [
-    { handle: 'example_ct_1', platform: 'twitter', followers: 50000, weight: 8, trackBuyCalls: true },
-    { handle: 'example_ct_2', platform: 'twitter', followers: 100000, weight: 9, trackBuyCalls: true },
-  ];
+  private influencers: InfluencerConfig[];
+
+  constructor() {
+    const saved = storage.loadInfluencers();
+    if (saved.length > 0) {
+      this.influencers = saved.map(s => ({ handle: s.handle, platform: s.platform, followers: s.followers, weight: s.weight, trackBuyCalls: s.trackBuyCalls }));
+      console.log(`📱 Loaded ${saved.length} influencers from disk`);
+    } else {
+      this.influencers = [];
+    }
+    const savedN = storage.loadNarratives();
+    for (const n of savedN) {
+      if (Date.now() - n.startedAt < 6 * 3600000) this.activeNarratives.set(n.keyword, { keywords: n.keywords, score: n.score, startedAt: n.startedAt });
+    }
+  }
 
   async start() {
     console.log('📱 Social Sentiment Module started');
@@ -190,6 +202,7 @@ export class SocialSentimentModule {
       for (const [key, val] of this.activeNarratives) {
         if (Date.now() - val.startedAt > 6 * 3600000) this.activeNarratives.delete(key);
       }
+      storage.saveNarratives(this.activeNarratives);
       setTimeout(detect, 60000);
     };
     detect();
@@ -246,7 +259,8 @@ export class SocialSentimentModule {
 
   addInfluencer(config: InfluencerConfig) {
     this.influencers.push(config);
-    console.log(`➕ Influencer: @${config.handle}`);
+    storage.addInfluencer({ handle: config.handle, platform: config.platform as 'twitter' | 'telegram', followers: config.followers, weight: config.weight, trackBuyCalls: config.trackBuyCalls, addedAt: Date.now() });
+    console.log(`➕ Influencer saved: @${config.handle}`);
   }
 
   getStats() {

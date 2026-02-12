@@ -4,6 +4,7 @@ import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { connection, wallet } from '../core/connection';
 import { JupiterSwap } from '../core/jupiter';
 import { sendAlert, formatTradeAlert } from '../core/alerts';
+import { storage } from '../core/storage';
 import { CONFIG } from '../config';
 import { TradeSignal } from '../types';
 
@@ -40,6 +41,9 @@ export class PumpFunModule {
 
   constructor() {
     this.jupiter = new JupiterSwap(connection, wallet);
+    const bl = storage.getBlacklistSet();
+    this.filters.blacklistedCreators = bl;
+    if (bl.size > 0) console.log(`🟣 Loaded ${bl.size} blacklisted creators`);
   }
 
   async start() {
@@ -157,7 +161,10 @@ export class PumpFunModule {
 
         if (score >= 75) {
           const tx = await this.jupiter.buy(mint, signal.amountSol!);
-          if (tx) await sendAlert(`✅ Pump.fun snipe!\n💰 ${signal.amountSol} SOL\n🔗 https://solscan.io/tx/${tx}`);
+          if (tx) {
+          await sendAlert(`✅ Pump.fun snipe!\n💰 ${signal.amountSol} SOL\n🔗 https://solscan.io/tx/${tx}`);
+          storage.addTrade({ id: tx, time: Date.now(), action: 'BUY', mint, symbol: tokenData.symbol, amountSol: signal.amountSol!, price: 0, tx, source: 'SNIPE' });
+        }
         }
       }
       return score;
@@ -232,7 +239,8 @@ export class PumpFunModule {
     const creator = data.traderPublicKey || data.creator;
     if (creator && this.filters.blacklistedCreators.has(creator)) return { passed: false, reason: 'Blacklisted' };
     const creatorTokens = creator ? (this.creatorHistory.get(creator) || []) : [];
-    if (creatorTokens.length > 5) return { passed: false, reason: 'Serial deployer' };
+    if (creatorTokens.length > 5) storage.addToBlacklist(creator, `Serial deployer: ${creatorTokens.length} tokens`, 'auto');
+      return { passed: false, reason: 'Serial deployer' };
     return { passed: true, reason: 'OK' };
   }
 

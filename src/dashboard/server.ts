@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
+import { storage } from '../core/storage';
 import { connection, wallet } from '../core/connection';
 import { CONFIG } from '../config';
 
@@ -71,8 +72,30 @@ export class DashboardServer {
       if (slippageBps !== undefined) CONFIG.trading.slippageBps = slippageBps;
       if (profitTarget !== undefined) CONFIG.trading.profitTarget = profitTarget;
       if (stopLoss !== undefined) CONFIG.trading.stopLoss = stopLoss;
+      storage.saveConfig();
       res.json({ success: true, config: CONFIG.trading });
     });
+
+    // Storage endpoints
+    this.app.get('/api/blacklist', (_req, res) => res.json({ entries: storage.loadBlacklist() }));
+    this.app.post('/api/blacklist', (req, res) => {
+      const { address, reason } = req.body;
+      if (!address) return res.status(400).json({ error: 'address required' });
+      storage.addToBlacklist(address, reason || 'Manual', 'manual');
+      res.json({ success: true });
+    });
+    this.app.delete('/api/blacklist/:address', (req, res) => { storage.removeFromBlacklist(req.params.address); res.json({ success: true }); });
+    this.app.get('/api/influencers', (_req, res) => res.json({ influencers: storage.loadInfluencers() }));
+    this.app.post('/api/influencers', (req, res) => {
+      const { handle, platform, followers, weight, trackBuyCalls } = req.body;
+      if (!handle) return res.status(400).json({ error: 'handle required' });
+      storage.addInfluencer({ handle, platform: platform || 'twitter', followers: followers || 0, weight: weight || 5, trackBuyCalls: trackBuyCalls !== false, addedAt: Date.now() });
+      this.modules.social?.addInfluencer({ handle, platform: platform || 'twitter', followers: followers || 0, weight: weight || 5, trackBuyCalls: trackBuyCalls !== false });
+      res.json({ success: true });
+    });
+    this.app.delete('/api/influencers/:handle', (req, res) => { storage.removeInfluencer(req.params.handle); this.modules.social?.removeInfluencer(req.params.handle); res.json({ success: true }); });
+    this.app.get('/api/storage/stats', (_req, res) => res.json(storage.getStorageStats()));
+    this.app.get('/api/trades/stats', (_req, res) => res.json(storage.getTradeStats()));
 
     // Serve dashboard HTML
     this.app.get('*', (_req, res) => {
@@ -97,6 +120,7 @@ export class DashboardServer {
     const alert = { time: Date.now(), type, message };
     this.recentAlerts.push(alert);
     if (this.recentAlerts.length > 200) this.recentAlerts.shift();
+    storage.addAlert(alert);
     this.broadcast('alert', alert);
   }
 
@@ -108,6 +132,7 @@ export class DashboardServer {
 
   updatePerformance(balanceSol: number) {
     this.performanceHistory.push({ time: Date.now(), balanceSol });
+    storage.addPerformanceEntry(balanceSol);
     this.broadcast('performance', { time: Date.now(), balanceSol });
   }
 

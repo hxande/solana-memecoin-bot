@@ -28,6 +28,7 @@ A fully automated trading bot for Solana memecoins. Snipes new tokens on Raydium
   - [Running Individual Modules](#running-individual-modules)
   - [Running Backtests](#running-backtests)
 - [Project Structure](#project-structure)
+- [Data Persistence](#data-persistence)
 - [API Reference (Dashboard)](#api-reference-dashboard)
 - [How Each Module Works](#how-each-module-works)
 - [Customization](#customization)
@@ -54,7 +55,7 @@ This bot combines six trading strategies into a single system:
 | **Social Sentiment** | Tracks Twitter/X mentions, influencer calls, DexScreener boosts, and emerging narratives | Continuous |
 | **Position Manager** | Monitors open positions and executes take-profit / stop-loss automatically | Every 10s |
 
-All signals are sent to **Telegram** in real time. The **web dashboard** at `http://localhost:3000` gives you a visual overview of everything.
+All signals are sent to **Telegram** in real time. The **web dashboard** at `http://localhost:3000` gives you a visual overview of everything. All state is **persisted to disk** — the bot survives restarts without losing data.
 
 ---
 
@@ -98,12 +99,12 @@ All signals are sent to **Telegram** in real time. The **web dashboard** at `htt
     │            Solana Blockchain              │    │
     │         (via Helius RPC + WebSocket)      │◄───┘
     └──────────────────────────────────────────┘
-                     │
-                     ▼
-    ┌──────────────────────────────────────────┐
-    │            Telegram Alerts                │
-    │     (Real-time trade notifications)      │
-    └──────────────────────────────────────────┘
+             │                    │
+             ▼                    ▼
+    ┌────────────────┐  ┌─────────────────┐
+    │ Telegram Alerts │  │ Persistence     │
+    │ (real-time)     │  │ (./data/*.json) │
+    └────────────────┘  └─────────────────┘
 ```
 
 ---
@@ -121,6 +122,7 @@ Monitors new liquidity pool creation on Raydium AMM via Helius Enhanced WebSocke
 3. Runs the token through safety filters (anti-rug checks)
 4. Assigns a confidence score (0-100)
 5. If score ≥ 70, executes a buy via Jupiter
+6. Persists the trade to `data/trades.json`
 
 **Safety filters applied:**
 - Minimum liquidity: 5 SOL
@@ -129,7 +131,7 @@ Monitors new liquidity pool creation on Raydium AMM via Helius Enhanced WebSocke
 - Freeze authority must be revoked
 - Minimum 10 holders
 - Token must be less than 5 minutes old
-- Developer address checked against blacklist
+- Developer address checked against blacklist (loaded from `data/blacklist.json`)
 
 **Key constants:**
 - `RAYDIUM_AMM`: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`
@@ -164,7 +166,7 @@ Pump.fun is where most Solana memecoins launch. This module connects to the Pump
 
 **Anti-rug checks:**
 - Excluded keywords in name/description: `rug`, `scam`, `test`, `airdrop`
-- Blacklisted creators (auto-blacklists serial deployers with 5+ tokens)
+- Blacklisted creators (auto-blacklists serial deployers with 5+ tokens, persisted to `data/blacklist.json`)
 - Creator holding percentage check
 
 **Bonding curve mechanics:**
@@ -179,7 +181,7 @@ Pump.fun is where most Solana memecoins launch. This module connects to the Pump
 
 **File:** `src/modules/walletTracker.ts`
 
-Monitors specified wallet addresses for swap transactions. When a tracked wallet buys a token, the bot copies the trade proportionally.
+Monitors specified wallet addresses for swap transactions. When a tracked wallet buys a token, the bot copies the trade proportionally. Wallets are persisted to `data/wallets.json`.
 
 **How it works:**
 1. Polls `getSignaturesForAddress` every 2 seconds per wallet
@@ -229,7 +231,7 @@ Tokens scoring ≥ 60/100 trigger a Telegram alert with full breakdown.
 
 **File:** `src/modules/socialSentiment.ts`
 
-Tracks social media activity to detect hype before price movement.
+Tracks social media activity to detect hype before price movement. Influencer list is persisted to `data/influencers.json`, narratives to `data/narratives.json`.
 
 **Data sources:**
 - **Twitter/X API** (if bearer token provided): Polls influencer tweets and token mentions
@@ -256,9 +258,8 @@ Tracks social media activity to detect hype before price movement.
 
 **Sentiment analysis:**
 - Bullish keywords: `moon`, `gem`, `100x`, `lfg`, `alpha`, `pump`, etc.
-- Bearish keywords: `rug`, `scam`, `dump`, `dead`, `avoid`, etc.
-- Bullish emojis: 🚀🔥💎🌙💰📈
 - Bearish emojis: 💀🔴📉⚠️
+- Bullish emojis: 🚀🔥💎🌙💰📈
 
 ---
 
@@ -266,17 +267,18 @@ Tracks social media activity to detect hype before price movement.
 
 **File:** `src/modules/positionManager.ts`
 
-Monitors all open positions every 10 seconds and enforces exit rules.
+Monitors all open positions every 10 seconds and enforces exit rules. Positions are persisted to `data/positions.json` and automatically restored on restart.
 
 **Exit triggers:**
 - **Take Profit**: Sells when position reaches the configured profit target (default: +100%)
 - **Stop Loss**: Sells when position drops below the configured loss limit (default: -50%)
 
 **How it works:**
-1. Loops through all open positions
+1. Loops through all open positions (loaded from disk on startup)
 2. Fetches current price from Birdeye
 3. Calculates unrealized P&L
 4. Sends Telegram alert and executes sell if TP or SL is hit
+5. Logs the closed trade to `data/trades.json` with final P&L
 
 ---
 
@@ -329,10 +331,12 @@ Express + WebSocket server serving a real-time single-page dashboard.
 - Module status indicators (ON/OFF for each module)
 - Open positions table with real-time P&L
 - Live alerts feed (WebSocket-powered, no refresh needed)
-- Trading configuration editor (max buy, slippage, TP, SL)
-- Tracked wallets list with add/remove
+- Trading configuration editor (max buy, slippage, TP, SL) — changes persist to disk
+- Tracked wallets list with add/remove — persists to disk
 - Active narratives display from Social Sentiment module
 - Pump.fun and Social module statistics
+- Blacklist and influencer management via API
+- Storage statistics endpoint
 
 **Endpoints:** See [API Reference](#api-reference-dashboard).
 
@@ -356,6 +360,10 @@ Express + WebSocket server serving a real-time single-page dashboard.
 chmod +x setup.sh setup-part2.sh
 ./setup.sh
 ./setup-part2.sh
+
+# Apply persistence patch
+chmod +x patch-storage.sh
+./patch-storage.sh
 
 # Enter the project directory
 cd solana-memecoin-bot
@@ -488,9 +496,11 @@ npm run dev
 
 On startup, the bot will:
 1. Print your wallet address and balance
-2. Start all six trading modules
-3. Start the web dashboard
-4. Send a Telegram notification confirming it is running
+2. Load all persisted state from `./data/` (config, wallets, positions, blacklist, etc.)
+3. Print trade history stats (win rate, total P&L)
+4. Start all six trading modules
+5. Start the web dashboard
+6. Send a Telegram notification confirming it is running
 
 ### Running Individual Modules
 
@@ -532,8 +542,17 @@ solana-memecoin-bot/
 ├── tsconfig.json                 # TypeScript configuration
 ├── README.md                     # This file
 │
-├── data/
-│   └── backtest/                 # Historical data and backtest results
+├── data/                         # All persisted state (auto-created)
+│   ├── config.json               # Runtime trading parameters
+│   ├── wallets.json              # Tracked wallets
+│   ├── positions.json            # Open positions
+│   ├── trades.json               # Trade history (max 5000)
+│   ├── alerts.json               # Alert history (max 1000)
+│   ├── blacklist.json            # Blacklisted creators/devs
+│   ├── influencers.json          # Social influencer list
+│   ├── narratives.json           # Active narratives
+│   ├── performance.json          # Balance history (max 10000)
+│   └── backtest/                 # Backtest data and results
 │
 └── src/
     ├── index.ts                  # Main entry point, starts all modules
@@ -543,7 +562,8 @@ solana-memecoin-bot/
     ├── core/
     │   ├── connection.ts         # Solana RPC connection + wallet keypair
     │   ├── jupiter.ts            # Jupiter Aggregator swap (buy/sell)
-    │   └── alerts.ts             # Telegram alert formatting and sending
+    │   ├── alerts.ts             # Telegram alert formatting and sending
+    │   └── storage.ts            # JSON file persistence layer
     │
     ├── modules/
     │   ├── sniper.ts             # Raydium new pool sniper
@@ -560,6 +580,68 @@ solana-memecoin-bot/
     └── scripts/
         └── runBacktest.ts        # Standalone backtest runner
 ```
+
+---
+
+## Data Persistence
+
+All bot state is persisted to JSON files in the `data/` directory. The bot survives restarts without losing any configuration, positions, or history.
+
+### What is Persisted
+
+| File | Data | Max Entries | Loaded On Startup |
+|------|------|-------------|-------------------|
+| `config.json` | Trading parameters (max buy, slippage, TP, SL) | 1 object | ✅ Overrides `.env` values |
+| `wallets.json` | Tracked wallets for copy-trading | Unlimited | ✅ Replaces default list |
+| `positions.json` | Open positions with entry price and source | Unlimited | ✅ Resumes monitoring |
+| `trades.json` | Complete trade history with P&L | 5,000 | ✅ Shown in dashboard |
+| `alerts.json` | Recent alert history | 1,000 | ✅ Shown in dashboard |
+| `blacklist.json` | Blacklisted creator/dev addresses | Unlimited | ✅ Loaded into Sniper + Pump.fun |
+| `influencers.json` | Twitter/social influencer list | Unlimited | ✅ Loaded into Social module |
+| `narratives.json` | Active narrative keywords (< 6h old) | Unlimited | ✅ Loaded into Social module |
+| `performance.json` | Balance history over time | 10,000 | ✅ Shown in dashboard chart |
+
+### How It Works
+
+- **Debounced writes**: Disk writes are debounced (1-5 seconds) to avoid excessive I/O during bursts of activity.
+- **Atomic writes**: Data is written to a `.tmp` file first, then renamed — preventing corruption if the process crashes mid-write.
+- **Corruption recovery**: If a JSON file is corrupted, it is automatically backed up as `.bak.<timestamp>` and the bot starts fresh for that file.
+- **Graceful shutdown**: On `SIGINT` (Ctrl+C) or `SIGTERM`, all pending writes are flushed to disk before exit.
+- **Crash protection**: Even on `uncaughtException`, the bot flushes storage before exiting.
+- **Cache layer**: Files are read from disk once, then served from an in-memory cache for performance.
+
+### Storage API (Dashboard)
+
+```bash
+# View storage statistics (file sizes, entry counts)
+curl http://localhost:3000/api/storage/stats
+
+# View trade statistics (win rate, total P&L)
+curl http://localhost:3000/api/trades/stats
+
+# Manage blacklist
+curl http://localhost:3000/api/blacklist
+curl -X POST http://localhost:3000/api/blacklist \
+  -H "Content-Type: application/json" \
+  -d '{"address": "ScammerAddress...", "reason": "Known rugger"}'
+curl -X DELETE http://localhost:3000/api/blacklist/ScammerAddress...
+
+# Manage influencers
+curl http://localhost:3000/api/influencers
+curl -X POST http://localhost:3000/api/influencers \
+  -H "Content-Type: application/json" \
+  -d '{"handle": "crypto_whale", "followers": 50000, "weight": 8}'
+curl -X DELETE http://localhost:3000/api/influencers/crypto_whale
+```
+
+### Priority Order for Config
+
+When the bot starts, configuration is resolved in this order (last wins):
+
+1. **`.env` file** — Base defaults
+2. **`data/config.json`** — Runtime changes saved from the dashboard
+
+This means if you change `MAX_BUY_SOL` in the dashboard, that value persists across restarts even though `.env` still has the old value. To reset to `.env` defaults, delete `data/config.json`.
 
 ---
 
@@ -601,6 +683,20 @@ Returns all open positions with current P&L.
 
 Returns the last 100 executed trades.
 
+### GET `/api/trades/stats`
+
+Returns aggregated trade statistics.
+
+```json
+{
+  "total": 150,
+  "wins": 87,
+  "losses": 63,
+  "winRate": 58.0,
+  "totalPnlSol": 3.45
+}
+```
+
 ### GET `/api/alerts`
 
 Returns the last 50 alerts.
@@ -611,7 +707,7 @@ Returns all tracked wallets and their configuration.
 
 ### POST `/api/wallets`
 
-Add a new wallet to track.
+Add a new wallet to track. Persists to disk immediately.
 
 ```json
 {
@@ -624,7 +720,7 @@ Add a new wallet to track.
 
 ### POST `/api/config`
 
-Update trading parameters at runtime (no restart needed).
+Update trading parameters at runtime (no restart needed). Persists to disk.
 
 ```json
 {
@@ -642,6 +738,64 @@ Returns Pump.fun module statistics (tokens processed, trades tracked, etc.).
 ### GET `/api/social/stats`
 
 Returns social sentiment statistics and active narratives.
+
+### GET `/api/blacklist`
+
+Returns all blacklisted addresses with reason and timestamp.
+
+### POST `/api/blacklist`
+
+Manually blacklist a creator/developer address.
+
+```json
+{
+  "address": "SuspiciousAddress...",
+  "reason": "Known scammer"
+}
+```
+
+### DELETE `/api/blacklist/:address`
+
+Remove an address from the blacklist.
+
+### GET `/api/influencers`
+
+Returns all tracked influencers.
+
+### POST `/api/influencers`
+
+Add a new influencer to track. Persists to disk and immediately starts monitoring.
+
+```json
+{
+  "handle": "crypto_alpha",
+  "platform": "twitter",
+  "followers": 75000,
+  "weight": 8,
+  "trackBuyCalls": true
+}
+```
+
+### DELETE `/api/influencers/:handle`
+
+Remove an influencer from tracking.
+
+### GET `/api/storage/stats`
+
+Returns file sizes and entry counts for all persisted data.
+
+```json
+{
+  "config": { "exists": true, "sizeKB": 0.2 },
+  "wallets": { "exists": true, "sizeKB": 0.5, "entries": 3 },
+  "trades": { "exists": true, "sizeKB": 45.2, "entries": 312 },
+  "blacklist": { "exists": true, "sizeKB": 2.1, "entries": 47 }
+}
+```
+
+### GET `/api/performance`
+
+Returns balance history for the equity chart.
 
 ### WebSocket
 
@@ -692,11 +846,12 @@ Signal Detected (any module)
 │ (skipPreflight)  │
 └────────┬────────┘
          │
-         ▼
-┌─────────────────┐
-│ Telegram Alert   │
-│ + Dashboard WS   │
-└─────────────────┘
+         ├──────────────────────┐
+         ▼                      ▼
+┌─────────────────┐  ┌──────────────────┐
+│ Telegram Alert   │  │ Persist to disk  │
+│ + Dashboard WS   │  │ (trades.json)    │
+└─────────────────┘  └──────────────────┘
 ```
 
 ### Jupiter Swap
@@ -713,43 +868,39 @@ All trades go through Jupiter Aggregator (`https://quote-api.jup.ag/v6`), which:
 
 ### Adding Wallets to Track
 
-Edit the `trackedWallets` array in `src/modules/walletTracker.ts`:
+**Via dashboard API (recommended — persists automatically):**
+
+```bash
+curl -X POST http://localhost:3000/api/wallets \
+  -H "Content-Type: application/json" \
+  -d '{"address": "RealWalletHere", "label": "Top Trader", "copyPct": 50, "minTradeSol": 0.5}'
+```
+
+**Via code** — edit `src/modules/walletTracker.ts` defaults (loaded only if `data/wallets.json` doesn't exist):
 
 ```typescript
-private trackedWallets: WalletConfig[] = [
+this.trackedWallets = [
   {
     address: 'RealWalletAddressHere',
     label: 'Top Trader',
-    copyPct: 50,        // Copy 50% of their trade size
-    minTradeSol: 0.5,   // Ignore trades under 0.5 SOL
+    copyPct: 50,
+    minTradeSol: 0.5,
     enabled: true,
   },
 ];
 ```
 
-Or add wallets at runtime via the dashboard API:
-
-```bash
-curl -X POST http://localhost:3000/api/wallets \
-  -H "Content-Type: application/json" \
-  -d '{"address": "...", "label": "Whale", "copyPct": 30, "minTradeSol": 1}'
-```
-
 ### Adding Influencers
 
-Edit the `influencers` array in `src/modules/socialSentiment.ts`:
+**Via dashboard API (persists automatically):**
 
-```typescript
-private influencers: InfluencerConfig[] = [
-  {
-    handle: 'twitter_handle',   // Without the @
-    platform: 'twitter',
-    followers: 50000,
-    weight: 8,                  // 1-10 importance
-    trackBuyCalls: true,
-  },
-];
+```bash
+curl -X POST http://localhost:3000/api/influencers \
+  -H "Content-Type: application/json" \
+  -d '{"handle": "crypto_whale", "followers": 50000, "weight": 8}'
 ```
+
+**Via code** — edit `src/modules/socialSentiment.ts`.
 
 ### Tuning Filters
 
@@ -784,7 +935,7 @@ private filters = {
 ### Creating Backtest Strategies
 
 ```typescript
-const myStrategy: BacktestStrategy = {
+const myStrategy = {
   name: 'My Custom Strategy',
   filters: {
     minLiquidity: 3000,
@@ -826,6 +977,8 @@ const myStrategy: BacktestStrategy = {
 
 6. **The `.env` file must be in `.gitignore`.** This is already configured, but double-check before pushing to any repository.
 
+7. **The `data/` directory is also in `.gitignore`.** Your trade history and wallet list are not committed to git.
+
 ### What the Filters Protect Against
 
 | Risk | Protection |
@@ -833,7 +986,7 @@ const myStrategy: BacktestStrategy = {
 | **Rug pulls** | Mint authority check, LP burn check, holder concentration |
 | **Honeypots** | Slippage limits, sell simulation (via Jupiter) |
 | **Wash trading** | Unique trader count, buy/sell ratio analysis |
-| **Serial scammers** | Creator history tracking, auto-blacklisting |
+| **Serial scammers** | Creator history tracking, auto-blacklisting (persisted) |
 | **Low liquidity** | Minimum liquidity filters, liquidity/mcap ratio |
 
 ### What the Filters Cannot Protect Against
@@ -874,6 +1027,17 @@ const myStrategy: BacktestStrategy = {
 **Dashboard not loading**
 - Check if port 3000 is available: `lsof -i :3000`
 - Change the port in `.env` with `DASHBOARD_PORT=3001`
+
+**Data not persisting**
+- Check that `./data/` directory exists and is writable
+- Look for `.bak.*` files — indicates a corrupted file was recovered
+- Check console for `💾 Write error` messages
+- Run `curl http://localhost:3000/api/storage/stats` to check file states
+
+**Bot lost state after restart**
+- Make sure the bot shut down gracefully (Ctrl+C, not kill -9)
+- Check `data/` directory for the JSON files
+- If files exist but are empty, check for `.tmp` files (incomplete writes)
 
 **TypeScript compilation errors**
 - Run `npx tsc --noEmit` to check for type errors
