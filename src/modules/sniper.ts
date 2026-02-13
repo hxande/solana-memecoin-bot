@@ -13,6 +13,7 @@ export class SniperModule {
   private processedPools = new Set<string>();
   private lastSignature: string | undefined;
   private pollInterval = 3000;
+  private apiErrors = { helius: 0, birdeye: 0 };
 
   private filters = {
     minLiquiditySOL: 5, maxTopHolderPct: 30, requireMintRevoked: true,
@@ -29,16 +30,52 @@ export class SniperModule {
 
   async start() {
     console.log('🎯 Sniper Module started (polling mode)');
+    await this.validateApis();
     this.pollRaydium();
   }
 
+  // ══════════════════════════════
+  // Validate API keys on startup
+  // ══════════════════════════════
+  private async validateApis() {
+    // Test Helius
+    try {
+      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mintAccounts: ['So11111111111111111111111111111111111111112'] }),
+      });
+      if (res.ok) {
+        console.log('🎯 Helius API: ✅ Working');
+      } else {
+        console.error(`🎯 Helius API: ❌ Status ${res.status} — check HELIUS_API_KEY`);
+      }
+    } catch (err: any) {
+      console.error(`🎯 Helius API: ❌ ${err.message}`);
+    }
+
+    // Test Birdeye
+    try {
+      const res = await fetch('https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112', {
+        headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' },
+      });
+      if (res.ok) {
+        console.log('🎯 Birdeye API: ✅ Working');
+      } else {
+        console.error(`🎯 Birdeye API: ❌ Status ${res.status} — check BIRDEYE_API_KEY`);
+      }
+    } catch (err: any) {
+      console.error(`🎯 Birdeye API: ❌ ${err.message}`);
+    }
+  }
+
+  // ══════════════════════════════
+  // Poll Raydium AMM
+  // ══════════════════════════════
   private async pollRaydium() {
     const poll = async () => {
       try {
         const sigs = await connection.getSignaturesForAddress(
-          RAYDIUM_AMM,
-          { limit: 10, until: this.lastSignature },
-          'confirmed'
+          RAYDIUM_AMM, { limit: 10, until: this.lastSignature }, 'confirmed'
         );
 
         if (sigs.length > 0) {
@@ -69,42 +106,43 @@ export class SniperModule {
       );
       const postTokens = (tx.meta.postTokenBalances || []).map((b: any) => b.mint);
       const newMints = postTokens.filter(
-        (mint: string) => !preTokens.has(mint) && mint !== 'So11111111111111111111111111111111111111112'
+        (m: string) => !preTokens.has(m) && m !== 'So11111111111111111111111111111111111111112'
       );
-      const uniqueMints = [...new Set(newMints)];
+      const unique = [...new Set(newMints)];
 
-      for (const mint of uniqueMints) {
+      for (const mint of unique) {
         if (this.processedPools.has(mint)) continue;
         this.processedPools.add(mint);
         console.log(`\n🆕 Raydium new pool: ${mint}`);
         await this.evaluateAndBuy(mint);
       }
-    } catch {}
+    } catch (err: any) {
+      console.error(`🎯 ProcessTx error (${signature.slice(0, 8)}...): ${err.message}`);
+    }
   }
 
   private async evaluateAndBuy(mint: string) {
     const tokenInfo = await this.analyzeToken(mint);
     if (!tokenInfo) {
       console.log(`  ⚠️  Could not fetch token data — skipping`);
+      console.log(`  📊 API errors: Helius=${this.apiErrors.helius}, Birdeye=${this.apiErrors.birdeye}`);
       return;
     }
 
-    // ── Detailed filter logging ──
     console.log(`  📋 ${tokenInfo.symbol} (${tokenInfo.name})`);
+    const result = this.applyFiltersWithLog(tokenInfo);
 
-    const filterResult = this.applyFiltersWithLog(tokenInfo);
-
-    if (!filterResult.passed) {
-      console.log(`  🚫 BLOCKED — Score: ${filterResult.score}/100`);
+    if (!result.passed) {
+      console.log(`  🚫 BLOCKED — ${result.reason} | Score: ${result.score}/100`);
       return;
     }
 
-    console.log(`  ✅ PASSED — Score: ${filterResult.score}/100`);
+    console.log(`  ✅ PASSED — Score: ${result.score}/100`);
 
     const signal: TradeSignal = {
       type: 'SNIPE', action: 'BUY', mint,
       reason: `Nova pool | Liq: ${tokenInfo.liquidity} SOL | ${tokenInfo.holders} holders`,
-      confidence: filterResult.score, amountSol: CONFIG.trading.maxBuySol,
+      confidence: result.score, amountSol: CONFIG.trading.maxBuySol,
     };
 
     await sendAlert(formatTradeAlert(signal));
@@ -124,94 +162,149 @@ export class SniperModule {
         console.log(`  ❌ BUY FAILED (Jupiter error)`);
       }
     } else {
-      console.log(`  ⏭️  Score ${filterResult.score} < 50 — alert only, no buy`);
+      console.log(`  ⏭️  Score ${result.score} < 50 — alert only`);
     }
   }
 
-  // ==========================================
-  // Filters WITH detailed logging
-  // ==========================================
+  // ══════════════════════════════
+  // Filters
+  // ══════════════════════════════
   private applyFiltersWithLog(token: TokenInfo): { passed: boolean; reason: string; score: number } {
-    let score = 50;
-    let passed = true;
-    let failReason = '';
+    let score = 50, passed = true, fail = '';
 
-    // Liquidity
     const liqOk = token.liquidity >= this.filters.minLiquiditySOL;
     console.log(`  ${liqOk ? '✅' : '❌'} Liquidity: ${token.liquidity.toFixed(1)} SOL (min: ${this.filters.minLiquiditySOL})`);
-    if (!liqOk) { passed = false; failReason = 'Liquidez baixa'; }
-    else { score += Math.min(20, token.liquidity / 2); }
+    if (!liqOk) { passed = false; fail = 'Liquidez baixa'; }
+    else score += Math.min(20, token.liquidity / 2);
 
-    // Top holder
     const holderOk = token.topHolderPct <= this.filters.maxTopHolderPct || token.topHolderPct === 0;
     console.log(`  ${holderOk ? '✅' : '❌'} Top holder: ${token.topHolderPct.toFixed(1)}% (max: ${this.filters.maxTopHolderPct}%)`);
-    if (!holderOk && passed) { passed = false; failReason = `Top holder: ${token.topHolderPct}%`; }
-    else if (holderOk) { score += (30 - token.topHolderPct) / 2; }
+    if (!holderOk && passed) { passed = false; fail = `Top holder: ${token.topHolderPct}%`; }
+    else if (holderOk) score += (30 - token.topHolderPct) / 2;
 
-    // Mint authority
     const mintOk = !this.filters.requireMintRevoked || !token.isMintable;
-    console.log(`  ${mintOk ? '✅' : '❌'} Mint renounced: ${token.isRenounced ? 'YES' : 'NO'}${this.filters.requireMintRevoked ? ' (required)' : ''}`);
-    if (!mintOk && passed) { passed = false; failReason = 'Mint não revogada'; }
+    console.log(`  ${mintOk ? '✅' : '❌'} Mint renounced: ${token.isRenounced ? 'YES' : 'NO'}`);
+    if (!mintOk && passed) { passed = false; fail = 'Mint não revogada'; }
     if (token.isRenounced) score += 10;
 
-    // Holders
     const holdersOk = token.holders >= this.filters.minHolders;
     console.log(`  ${holdersOk ? '✅' : '❌'} Holders: ${token.holders} (min: ${this.filters.minHolders})`);
-    if (!holdersOk && passed) { passed = false; failReason = `Poucos holders: ${token.holders}`; }
-    else if (holdersOk) { score += Math.min(10, token.holders / 10); }
+    if (!holdersOk && passed) { passed = false; fail = `Poucos holders: ${token.holders}`; }
+    else if (holdersOk) score += Math.min(10, token.holders / 10);
 
-    // LP Burned
     console.log(`  ℹ️  LP burned: ${token.lpBurned ? 'YES' : 'UNKNOWN'}`);
-    console.log(`  ℹ️  Market cap: $${token.marketCap.toLocaleString()}`);
+    console.log(`  ℹ️  MCap: $${token.marketCap.toLocaleString()}`);
 
-    const finalScore = Math.min(100, Math.round(score));
-    console.log(`  🧮 Score: ${finalScore}/100`);
+    const s = Math.min(100, Math.round(score));
+    console.log(`  🧮 Score: ${s}/100`);
 
-    if (!passed) return { passed: false, reason: failReason, score: finalScore };
-    return { passed: true, reason: 'OK', score: finalScore };
+    return passed ? { passed: true, reason: 'OK', score: s } : { passed: false, reason: fail, score: s };
   }
 
+  // ══════════════════════════════
+  // Token analysis — with full error logging
+  // ══════════════════════════════
   private async analyzeToken(mint: string): Promise<TokenInfo | null> {
     try {
-      const [heliusData, birdeyeData] = await Promise.all([
+      const [heliusData, birdeyeData] = await Promise.allSettled([
         this.getHeliusTokenData(mint),
         this.getBirdeyeTokenData(mint),
       ]);
+
+      const helius = heliusData.status === 'fulfilled' ? heliusData.value : null;
+      const birdeye = birdeyeData.status === 'fulfilled' ? birdeyeData.value : null;
+
+      if (heliusData.status === 'rejected') {
+        console.error(`  ⚠️  Helius failed: ${heliusData.reason?.message || heliusData.reason}`);
+        this.apiErrors.helius++;
+      }
+      if (birdeyeData.status === 'rejected') {
+        console.error(`  ⚠️  Birdeye failed: ${birdeyeData.reason?.message || birdeyeData.reason}`);
+        this.apiErrors.birdeye++;
+      }
+
+      // Need at least birdeye for liquidity data
+      if (!birdeye) {
+        console.log(`  ⚠️  No Birdeye data — cannot evaluate liquidity`);
+        return null;
+      }
+
+      const topHolder = await this.getTopHolderPct(mint);
+
       return {
-        mint, symbol: heliusData?.symbol || 'UNKNOWN',
-        name: heliusData?.name || 'Unknown', decimals: heliusData?.decimals || 9,
-        poolAddress: '', liquidity: birdeyeData?.liquidity || 0,
-        marketCap: birdeyeData?.mc || 0, holders: birdeyeData?.holder || 0,
-        topHolderPct: await this.getTopHolderPct(mint), createdAt: Date.now(),
-        isRenounced: heliusData?.mintAuthority === null,
-        isMintable: heliusData?.mintAuthority !== null, lpBurned: false,
+        mint,
+        symbol: helius?.symbol || birdeye?.symbol || 'UNKNOWN',
+        name: helius?.name || birdeye?.name || 'Unknown',
+        decimals: helius?.decimals || 9,
+        poolAddress: '',
+        liquidity: birdeye?.liquidity || 0,
+        marketCap: birdeye?.mc || 0,
+        holders: birdeye?.holder || 0,
+        topHolderPct: topHolder,
+        createdAt: Date.now(),
+        isRenounced: helius?.mintAuthority === null,
+        isMintable: helius ? helius.mintAuthority !== null : false,
+        lpBurned: false,
       };
-    } catch { return null; }
+    } catch (err: any) {
+      console.error(`  ❌ analyzeToken error: ${err.message}`);
+      return null;
+    }
   }
 
   private async getHeliusTokenData(mint: string): Promise<any> {
     try {
-      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mintAccounts: [mint] }) });
+      const res = await fetch(`https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.heliusKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mintAccounts: [mint] }),
+      });
+      if (!res.ok) {
+        console.error(`  ⚠️  Helius HTTP ${res.status} for ${mint.slice(0, 8)}...`);
+        this.apiErrors.helius++;
+        return null;
+      }
       const data: any = await res.json();
       return data[0]?.onChainAccountInfo?.accountInfo?.data?.parsed?.info || null;
-    } catch { return null; }
+    } catch (err: any) {
+      console.error(`  ⚠️  Helius error: ${err.message}`);
+      this.apiErrors.helius++;
+      return null;
+    }
   }
 
   private async getBirdeyeTokenData(mint: string): Promise<any> {
     try {
-      const res: any = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
-        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
-      return (await res.json()).data || null;
-    } catch { return null; }
+      const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`, {
+        headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' },
+      });
+      if (!res.ok) {
+        console.error(`  ⚠️  Birdeye HTTP ${res.status} for ${mint.slice(0, 8)}...`);
+        this.apiErrors.birdeye++;
+        return null;
+      }
+      const data = await res.json() as any;
+      return data?.data || null;
+    } catch (err: any) {
+      console.error(`  ⚠️  Birdeye error: ${err.message}`);
+      this.apiErrors.birdeye++;
+      return null;
+    }
   }
 
   private async getTopHolderPct(mint: string): Promise<number> {
     try {
-      const res: any = await fetch(`https://public-api.birdeye.so/defi/token_holder?address=${mint}&limit=1`,
-        { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } });
-      return (await res.json()).data?.items?.[0]?.percentage || 0;
-    } catch { return 100; }
+      const res = await fetch(`https://public-api.birdeye.so/defi/token_holder?address=${mint}&limit=1`, {
+        headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' },
+      });
+      if (!res.ok) {
+        console.error(`  ⚠️  Birdeye holders HTTP ${res.status}`);
+        return 0;
+      }
+      const data = await res.json() as any;
+      return data?.data?.items?.[0]?.percentage || 0;
+    } catch (err: any) {
+      console.error(`  ⚠️  Top holder check error: ${err.message}`);
+      return 100;
+    }
   }
 }
