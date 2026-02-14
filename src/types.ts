@@ -44,3 +44,31 @@ export interface WalletConfig {
   minTradeSol: number;
   enabled: boolean;
 }
+
+export type BundleStatus = 'idle' | 'distributing' | 'buying' | 'active' | 'consolidating' | 'selling' | 'reclaiming' | 'error';
+
+export interface BundleWallet {
+  secretKeyB58: string;
+  publicKey: string;
+  solAllocated: number;
+  distributed: boolean;
+  bought: boolean;
+  consolidated: boolean;
+  reclaimed: boolean;
+  distributeTx?: string;
+  buyTx?: string;
+  consolidateTx?: string;
+  reclaimTx?: string;
+  tokenBalance?: string; // bigint as string
+}
+
+export interface BundleState {
+  mint: string;
+  status: BundleStatus;
+  totalSol: number;
+  createdAt: number;
+  updatedAt: number;
+  wallets: BundleWallet[];
+  sellTx?: string;
+  error?: string;
+}

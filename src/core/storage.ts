@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { WalletConfig, Position, TradeSignal } from '../types';
+import { WalletConfig, Position, TradeSignal, BundleState } from '../types';
 import { CONFIG } from '../config';
 
 export interface PersistedConfig {
@@ -28,6 +28,7 @@ export class Storage {
     config: 'config.json', wallets: 'wallets.json', positions: 'positions.json',
     trades: 'trades.json', alerts: 'alerts.json', blacklist: 'blacklist.json',
     influencers: 'influencers.json', narratives: 'narratives.json', performance: 'performance.json',
+    bundle: 'bundle.json',
   };
 
   private limits = { trades: 5000, alerts: 1000, performance: 10000 };
@@ -207,6 +208,10 @@ export class Storage {
     while (h.length > this.limits.performance) h.shift();
     this.writeFile(this.files.performance, h, 5000);
   }
+
+  // BUNDLE
+  loadBundle(): BundleState | null { return this.readFile<BundleState | null>(this.files.bundle, null); }
+  saveBundle(state: BundleState | null): void { this.writeFile(this.files.bundle, state, 100); }
 
   // FLUSH (call before shutdown)
   async flush(): Promise<void> {

@@ -97,6 +97,50 @@ export class DashboardServer {
     this.app.get('/api/storage/stats', (_req, res) => res.json(storage.getStorageStats()));
     this.app.get('/api/trades/stats', (_req, res) => res.json(storage.getTradeStats()));
 
+    // Bundle endpoints
+    this.app.get('/api/bundle/status', (_req, res) => {
+      res.json(this.modules.bundle?.getStatus() || null);
+    });
+
+    this.app.post('/api/bundle/create', async (req, res) => {
+      try {
+        const { mint, walletCount, totalSol } = req.body;
+        if (!mint || !walletCount || !totalSol) return res.status(400).json({ error: 'mint, walletCount, totalSol required' });
+        const state = await this.modules.bundle.createBundle(mint, walletCount, totalSol);
+        res.json({ success: true, wallets: state.wallets.length });
+      } catch (e: any) { res.status(400).json({ error: e.message }); }
+    });
+
+    this.app.post('/api/bundle/distribute', (_req, res) => {
+      if (!this.modules.bundle) return res.status(400).json({ error: 'Bundle module not available' });
+      res.json({ success: true, message: 'Distribution started' });
+      this.modules.bundle.distribute().catch((e: any) => console.error(`📦 Distribute error: ${e.message}`));
+    });
+
+    this.app.post('/api/bundle/buy', (_req, res) => {
+      if (!this.modules.bundle) return res.status(400).json({ error: 'Bundle module not available' });
+      res.json({ success: true, message: 'Buys started' });
+      this.modules.bundle.executeBuys().catch((e: any) => console.error(`📦 Buy error: ${e.message}`));
+    });
+
+    this.app.post('/api/bundle/sell', (_req, res) => {
+      if (!this.modules.bundle) return res.status(400).json({ error: 'Bundle module not available' });
+      res.json({ success: true, message: 'Sell flow started (consolidate → sell → reclaim)' });
+      this.modules.bundle.executeSellFlow().catch((e: any) => console.error(`📦 Sell flow error: ${e.message}`));
+    });
+
+    this.app.post('/api/bundle/cancel', (_req, res) => {
+      if (!this.modules.bundle) return res.status(400).json({ error: 'Bundle module not available' });
+      res.json({ success: true, message: 'Cancel started' });
+      this.modules.bundle.cancelBundle().catch((e: any) => console.error(`📦 Cancel error: ${e.message}`));
+    });
+
+    this.app.post('/api/bundle/reclaim', (_req, res) => {
+      if (!this.modules.bundle) return res.status(400).json({ error: 'Bundle module not available' });
+      res.json({ success: true, message: 'Reclaim started' });
+      this.modules.bundle.reclaimSol().catch((e: any) => console.error(`📦 Reclaim error: ${e.message}`));
+    });
+
     // Serve dashboard HTML
     this.app.get('*', (_req, res) => {
       res.send(this.getDashboardHTML());
@@ -208,18 +252,47 @@ tr:hover{background:var(--surface2)}
 <div class="card wide"><div class="card-title">🔔 Live Alerts</div><div class="feed" id="feed"><div class="alert-item"><span class="alert-time">--:--</span><span>Waiting...</span></div></div></div>
 
 <div class="card wide"><div class="card-title">👀 Tracked Wallets</div><div id="wlist" style="font-size:13px">Loading...</div><div style="display:flex;gap:8px;margin-top:12px"><input type="text" id="nw" placeholder="Wallet address..." style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px;color:var(--text);font-size:13px"><button class="btn" onclick="addW()">Add</button></div></div>
+
+<div class="card full"><div class="card-title">📦 Bundle Manager</div>
+<div id="bundle-create">
+<div style="display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:8px;align-items:end">
+<div class="cfg-item"><label>Token CA</label><input type="text" id="b-mint" placeholder="Token mint address..."></div>
+<div class="cfg-item"><label>Wallets (1-30)</label><input type="number" id="b-count" min="1" max="30" value="5"></div>
+<div class="cfg-item"><label>Total SOL</label><input type="number" id="b-sol" step="0.01" value="0.5"></div>
+<button class="btn" onclick="bundleCreate()" style="height:38px">Create Bundle</button>
+</div></div>
+<div id="bundle-active" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+<div><span style="font-size:13px;color:var(--muted)">Status:</span> <span id="b-status" style="font-weight:600;padding:2px 8px;border-radius:4px;font-size:12px;background:var(--surface2)">--</span>
+<span style="margin-left:12px;font-size:13px;color:var(--muted)" id="b-mint-label"></span></div>
+<div style="display:flex;gap:6px">
+<button class="btn" id="btn-dist" onclick="bundleDist()">Distribute</button>
+<button class="btn" id="btn-buy" onclick="bundleBuy()" style="background:var(--green)">Buy</button>
+<button class="btn" id="btn-sell" onclick="bundleSell()" style="background:var(--red)">Sell All</button>
+<button class="btn" id="btn-cancel" onclick="bundleCancel()" style="background:#6b7280">Cancel</button>
+</div></div>
+<div style="max-height:200px;overflow-y:auto"><table><thead><tr><th>Wallet</th><th>SOL</th><th>Funded</th><th>Bought</th><th>Consolidated</th><th>Reclaimed</th></tr></thead><tbody id="b-wallets"></tbody></table></div>
+<div id="b-error" style="display:none;margin-top:8px;padding:8px;background:rgba(239,68,68,.15);border-radius:6px;font-size:13px;color:var(--red)"></div>
+</div></div>
+
 </div>
 
 <script>
 const A=window.location.origin;let ws;
-function connect(){ws=new WebSocket(A.replace('http','ws'));ws.onopen=()=>{document.getElementById('st').textContent='Connected'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='alert')addAlert(m.data);};ws.onclose=()=>{document.getElementById('st').textContent='Disconnected';setTimeout(connect,3000)}}
+function connect(){ws=new WebSocket(A.replace('http','ws'));ws.onopen=()=>{document.getElementById('st').textContent='Connected'};ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='alert')addAlert(m.data);if(m.type==='bundle')loadBundle();};ws.onclose=()=>{document.getElementById('st').textContent='Disconnected';setTimeout(connect,3000)}}
 async function load(){try{const r=await(await fetch(A+'/api/status')).json();document.getElementById('bal').textContent=r.balanceSol.toFixed(4)+' SOL';document.getElementById('c-buy').value=r.config.maxBuySol;document.getElementById('c-slip').value=r.config.slippageBps;document.getElementById('c-tp').value=r.config.profitTarget;document.getElementById('c-sl').value=r.config.stopLoss;for(const[k,v]of Object.entries(r.modules)){const e=document.getElementById('m-'+k);if(e){e.textContent=v?'ON':'OFF';e.className=v?'on':'off'}}}catch{}}
 async function loadAlerts(){try{const r=await(await fetch(A+'/api/alerts')).json();const f=document.getElementById('feed');if(r.alerts.length)f.innerHTML=r.alerts.reverse().slice(0,30).map(a=>'<div class="alert-item"><span class="alert-time">'+new Date(a.time).toLocaleTimeString()+'</span><span>'+a.message+'</span></div>').join('')}catch{}}
 async function loadWallets(){try{const r=await(await fetch(A+'/api/wallets')).json();document.getElementById('wlist').innerHTML=r.wallets.length?r.wallets.map(w=>'<div style="padding:6px 0;border-bottom:1px solid var(--border)">'+w.label+' ('+w.copyPct+'%)</div>').join(''):'<div style="color:var(--muted)">No wallets</div>'}catch{}}
 function addAlert(a){const f=document.getElementById('feed');f.insertAdjacentHTML('afterbegin','<div class="alert-item"><span class="alert-time">'+new Date(a.time).toLocaleTimeString()+'</span><span>'+a.message+'</span></div>')}
 async function saveCfg(){await fetch(A+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({maxBuySol:+document.getElementById('c-buy').value,slippageBps:+document.getElementById('c-slip').value,profitTarget:+document.getElementById('c-tp').value,stopLoss:+document.getElementById('c-sl').value})})}
 async function addW(){const a=document.getElementById('nw').value.trim();if(!a)return;await fetch(A+'/api/wallets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:a,label:a.slice(0,8)+'...',copyPct:50,minTradeSol:0.5})});document.getElementById('nw').value='';loadWallets()}
-connect();load();loadAlerts();loadWallets();setInterval(load,30000);setInterval(loadAlerts,15000);
+async function bundleCreate(){const mint=document.getElementById('b-mint').value.trim();const count=+document.getElementById('b-count').value;const sol=+document.getElementById('b-sol').value;if(!mint)return alert('Enter token CA');try{const r=await fetch(A+'/api/bundle/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mint,walletCount:count,totalSol:sol})});const d=await r.json();if(!r.ok)return alert(d.error);loadBundle()}catch(e){alert(e)}}
+async function bundleDist(){await fetch(A+'/api/bundle/distribute',{method:'POST'});loadBundle()}
+async function bundleBuy(){await fetch(A+'/api/bundle/buy',{method:'POST'});loadBundle()}
+async function bundleSell(){if(!confirm('Consolidate tokens, sell, and reclaim SOL?'))return;await fetch(A+'/api/bundle/sell',{method:'POST'});loadBundle()}
+async function bundleCancel(){if(!confirm('Cancel bundle? Will try to salvage funds.'))return;await fetch(A+'/api/bundle/cancel',{method:'POST'});loadBundle()}
+async function loadBundle(){try{const r=await(await fetch(A+'/api/bundle/status')).json();const cr=document.getElementById('bundle-create');const ac=document.getElementById('bundle-active');if(!r){cr.style.display='';ac.style.display='none';return}cr.style.display='none';ac.style.display='';document.getElementById('b-status').textContent=r.status.toUpperCase();document.getElementById('b-status').style.color=r.status==='active'?'var(--green)':r.status==='error'?'var(--red)':'var(--text)';document.getElementById('b-mint-label').textContent=r.mint.slice(0,8)+'... | '+r.totalSol+' SOL | '+r.wallets.length+' wallets';const chk=(v)=>v?'\\u2705':'\\u2B1C';document.getElementById('b-wallets').innerHTML=r.wallets.map(w=>'<tr><td style="font-family:monospace;font-size:11px">'+w.publicKey.slice(0,8)+'...</td><td>'+w.solAllocated.toFixed(4)+'</td><td>'+chk(w.distributed)+'</td><td>'+chk(w.bought)+'</td><td>'+chk(w.consolidated)+'</td><td>'+chk(w.reclaimed)+'</td></tr>').join('');const busy=['distributing','buying','consolidating','selling','reclaiming'].includes(r.status);document.getElementById('btn-dist').disabled=busy||r.status==='active';document.getElementById('btn-buy').disabled=busy||r.status==='active';document.getElementById('btn-sell').disabled=busy;document.getElementById('btn-cancel').disabled=busy&&r.status!=='error';const er=document.getElementById('b-error');if(r.error){er.style.display='';er.textContent=r.error}else{er.style.display='none'}}catch{}}
+connect();load();loadAlerts();loadWallets();loadBundle();setInterval(load,30000);setInterval(loadAlerts,15000);setInterval(loadBundle,5000);
 </script></body></html>`;
   }
 }

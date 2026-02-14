@@ -5,6 +5,7 @@ import { PositionManager } from './modules/positionManager';
 import { PumpFunModule } from './modules/pumpfun';
 import { SocialSentimentModule } from './modules/socialSentiment';
 import { Backtester } from './modules/backtester';
+import { BundleManager } from './modules/bundleManager';
 import { DashboardServer } from './dashboard/server';
 import { sendAlert } from './core/alerts';
 import { storage } from './core/storage';
@@ -41,9 +42,11 @@ async function main() {
   const pumpfun = new PumpFunModule(positions);
   const social = new SocialSentimentModule();
   const backtester = new Backtester();
+  const bundle = new BundleManager();
 
   const dashboard = new DashboardServer(parseInt(process.env.DASHBOARD_PORT || '3000'));
-  dashboard.setModules({ sniper, tracker, monitor, positions, pumpfun, social, backtester });
+  dashboard.setModules({ sniper, tracker, monitor, positions, pumpfun, social, backtester, bundle });
+  bundle.setBroadcast((type, data) => dashboard.broadcast(type, data));
 
   console.log('  🚀 Starting modules...\n');
 
