@@ -53,7 +53,7 @@ This bot combines six trading strategies into a single system:
 | **Copy-Trading** | Mirrors trades from wallets you specify (smart money, whales, influencers) | ~2-5s |
 | **Token Monitor** | Scores trending tokens using on-chain data (safety, liquidity, holders, momentum) | Continuous |
 | **Social Sentiment** | Tracks Twitter/X mentions, influencer calls, DexScreener boosts, and emerging narratives | Continuous |
-| **Position Manager** | Monitors open positions and executes take-profit / stop-loss automatically | Every 10s |
+| **Position Manager** | Monitors open positions with TP, SL, trailing stop, and time-based exits — executes real sells via Jupiter | Every 5s |
 
 All signals are sent to **Telegram** in real time. The **web dashboard** at `http://localhost:3000` gives you a visual overview of everything. All state is **persisted to disk** — the bot survives restarts without losing data.
 
@@ -115,19 +115,33 @@ All signals are sent to **Telegram** in real time. The **web dashboard** at `htt
 
 **File:** `src/modules/sniper.ts`
 
-Monitors new liquidity pool creation on Raydium AMM via Helius Enhanced WebSocket. When a new pool is detected, it:
+Polls for new liquidity pool creation on Raydium AMM via Helius RPC. When a new pool is detected, it:
 
 1. Extracts the token mint address from the transaction
 2. Fetches token metadata from Helius and market data from Birdeye
-3. Runs the token through safety filters (anti-rug checks)
-4. Assigns a confidence score (0-100)
-5. If score ≥ 70, executes a buy via Jupiter
-6. Persists the trade to `data/trades.json`
+3. Runs the token through safety filters (anti-rug checks) — all filters fail-closed (API errors assume unsafe)
+4. Assigns a confidence score starting from **0** (every point must be earned)
+5. If score >= configurable threshold (default **70**), checks max open positions, then executes a buy via Jupiter
+6. Registers the position with PositionManager for automatic TP/SL/trailing stop monitoring
+7. Persists the trade to `data/trades.json`
 
-**Safety filters applied:**
+**Scoring breakdown (max 100, base 0):**
+
+| Check | Max Points | Details |
+|-------|-----------|---------|
+| Liquidity | 20 | `min(20, floor(liquidity / 5))` — needs 100 SOL for max |
+| Top holder | 15 | `min(15, floor((30 - topHolderPct) / 2))` |
+| Mint renounced | 15 | +15 if mint authority is null |
+| Freeze revoked | 10 | +10 if freeze authority is null |
+| Holders | 15 | `min(15, floor(holders / 20))` — needs 300 for max |
+| LP burned | 10 | +10 if LP tokens are burned |
+| Fresh token | 10 | +10 if token is < 120 seconds old |
+| Blacklisted dev | -100 | Instant reject |
+
+**Safety filters (hard rejections):**
 - Minimum liquidity: 5 SOL
-- Maximum top holder concentration: 30%
-- Mint authority must be revoked
+- Maximum top holder concentration: 30% (returns 100% on API error — fail-closed)
+- Mint authority must be revoked (assumes mintable on Helius failure — fail-closed)
 - Freeze authority must be revoked
 - Minimum 10 holders
 - Token must be less than 5 minutes old
@@ -135,7 +149,7 @@ Monitors new liquidity pool creation on Raydium AMM via Helius Enhanced WebSocke
 
 **Key constants:**
 - `RAYDIUM_AMM`: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`
-- WebSocket: Helius Enhanced Transactions API
+- Polling: `getSignaturesForAddress` every 3 seconds
 
 ---
 
@@ -154,20 +168,29 @@ Pump.fun is where most Solana memecoins launch. This module connects to the Pump
 | `migrationSnipe` | BC progress 80-90 SOL | Buys right before the token migrates to Raydium |
 | `socialMomentum` | Volume surge detected | Buys when buy volume spikes 3x in 60 seconds |
 
-**Scoring criteria (max 100):**
-- Token age (< 5 min: +10)
-- Market cap range (5-30 SOL: +15)
-- Replies on Pump.fun (≥ 10: +15)
-- Number of buys (≥ 5: +10)
-- Unique traders (≥ 3: +10)
-- Buy/sell ratio (≥ 3:1: +15)
-- Creator holdings (< 10%: +10)
-- Bonding curve progress (60-85%: +15)
+**Scoring criteria (max 100, threshold default 65):**
+
+| Check | Max Points | Details |
+|-------|-----------|---------|
+| Token age | 10 | +10 if < 5 minutes old |
+| Market cap range | 10 | +10 if 5-30 SOL (sweet spot) |
+| Replies | 15 | >= 10 replies: +15, >= 3: +8 |
+| Buy count | 10 | >= 8 buys: +10, >= 3: +5 (tiered) |
+| Unique traders | 10 | >= 5 traders: +10, >= 2: +5 (tiered) |
+| Buy/sell ratio (count) | 15 | >= 3:1: +15, >= 1.5:1: +8 |
+| Volume-weighted B/S | -15 | Penalizes if sell volume > 2x buy volume |
+| Volume | 5 | +5 if total buy volume >= 1 SOL |
+| Creator holdings | 10 | < 10%: +10 (uses actual token supply, not hardcoded 1B) |
+| Bonding curve | 10 | +10 if 60-85% complete |
+| Honeypot signal | -20 | Penalizes if 5+ buys with 0 sells after 30s of trading |
 
 **Anti-rug checks:**
 - Excluded keywords in name/description: `rug`, `scam`, `test`, `airdrop`
 - Blacklisted creators (auto-blacklists serial deployers with 5+ tokens, persisted to `data/blacklist.json`)
-- Creator holding percentage check
+- Creator holding percentage check (fail-closed: returns 50% on error, not 0%)
+- Honeypot detection: penalizes tokens with many buys but zero sells
+- Volume-weighted sell pressure detection
+- Max open positions check before buying
 
 **Bonding curve mechanics:**
 - Pump.fun tokens start on a bonding curve
@@ -181,13 +204,15 @@ Pump.fun is where most Solana memecoins launch. This module connects to the Pump
 
 **File:** `src/modules/walletTracker.ts`
 
-Monitors specified wallet addresses for swap transactions. When a tracked wallet buys a token, the bot copies the trade proportionally. Wallets are persisted to `data/wallets.json`.
+Monitors specified wallet addresses for swap transactions. When a tracked wallet buys or sells a token, the bot copies the trade proportionally. Wallets are persisted to `data/wallets.json`.
 
 **How it works:**
 1. Polls `getSignaturesForAddress` every 2 seconds per wallet
 2. Fetches and parses each transaction
 3. Compares pre/post token balances to detect swaps
-4. If a buy is detected and exceeds the minimum threshold, copies it
+4. Calculates actual SOL amount from `preBalances`/`postBalances` (not hardcoded)
+5. If a buy is detected and exceeds the minimum threshold, copies it proportionally
+6. If a sell is detected for a token we hold, sells our full position (copy-sell)
 
 **Configuration per wallet:**
 ```typescript
@@ -220,7 +245,7 @@ Continuously scores trending tokens from Birdeye using four categories:
 |----------|-----------|---------------|
 | **Safety** | 30 | Mint renounced (+10), not mintable (+5), LP burned (+10), top holder < 10% (+5) |
 | **Liquidity** | 25 | Liquidity ≥ $100k (+10), good liquidity/mcap ratio (+10), low mcap < $1M (+5) |
-| **Community** | 25 | Holders ≥ 500 (+15), ≥ 100 (+10), ≥ 30 (+5), plus growth rate (+10) |
+| **Community** | 25 | Holders ≥ 500 (+15), ≥ 100 (+10), ≥ 30 (+5) — no unconditional bonus |
 | **Momentum** | 20 | Positive 1h price change (+10), volume increasing > 50% (+10) |
 
 Tokens scoring ≥ 60/100 trigger a Telegram alert with full breakdown.
@@ -267,18 +292,26 @@ Tracks social media activity to detect hype before price movement. Influencer li
 
 **File:** `src/modules/positionManager.ts`
 
-Monitors all open positions every 10 seconds and enforces exit rules. Positions are persisted to `data/positions.json` and automatically restored on restart.
+Monitors all open positions every **5 seconds** and enforces exit rules. Positions are persisted to `data/positions.json` and automatically restored on restart. Shared with Sniper and Pump.fun modules via constructor injection — both modules register positions after successful buys.
 
 **Exit triggers:**
 - **Take Profit**: Sells when position reaches the configured profit target (default: +100%)
+- **Trailing Stop**: Tracks the highest price per position. When profit exceeds the activation threshold (default: +30%) and price drops from peak by the trailing stop percentage (default: 30%), sells to lock in gains. This captures profits on tokens that pump then fade.
 - **Stop Loss**: Sells when position drops below the configured loss limit (default: -50%)
+- **Time-Based Exit**: If a position is held longer than `maxHoldTimeMinutes` (default: 30) and PnL is below +10%, sells. Memecoins that don't move quickly rarely recover.
+
+**Position limits:**
+- Maximum concurrent positions: configurable via `MAX_POSITIONS` (default: 5). Modules check `canOpenPosition()` before buying.
 
 **How it works:**
 1. Loops through all open positions (loaded from disk on startup)
 2. Fetches current price from Birdeye
-3. Calculates unrealized P&L
-4. Sends Telegram alert and executes sell if TP or SL is hit
-5. Logs the closed trade to `data/trades.json` with final P&L
+3. Updates highest price tracking for trailing stop
+4. Calculates unrealized P&L and distance from peak
+5. Checks all four exit conditions in priority order (TP > trailing > SL > time)
+6. **Executes an actual sell via Jupiter** — gets ATA token balance, calls `jupiter.sell()` with the full raw token amount
+7. Sends Telegram alert with exit reason and TX hash
+8. Logs the closed trade to `data/trades.json` with final P&L
 
 ---
 
@@ -426,6 +459,16 @@ AUTO_SELL_PROFIT_PCT=100
 STOP_LOSS_PCT=50
 GAS_PRIORITY_FEE=0.005
 
+# Position Management
+MAX_POSITIONS=5
+TRAILING_STOP_PCT=30
+TRAILING_ACTIVATION_PCT=30
+MAX_HOLD_TIME_MINUTES=30
+
+# Scoring Thresholds
+SNIPER_MIN_SCORE=70
+PUMPFUN_MIN_SCORE=65
+
 # Dashboard
 DASHBOARD_PORT=3000
 ```
@@ -477,6 +520,12 @@ Without this key, the bot still works using DexScreener boosts and Birdeye socia
 | `AUTO_SELL_PROFIT_PCT` | 100 | Take profit at +100% gain |
 | `STOP_LOSS_PCT` | 50 | Stop loss at -50% |
 | `GAS_PRIORITY_FEE` | 0.005 | Priority fee in SOL for faster transactions |
+| `MAX_POSITIONS` | 5 | Maximum concurrent open positions |
+| `TRAILING_STOP_PCT` | 30 | Trailing stop: sell when price drops this % from peak |
+| `TRAILING_ACTIVATION_PCT` | 30 | Trailing stop activates after this % profit |
+| `MAX_HOLD_TIME_MINUTES` | 30 | Close position after this many minutes if PnL < 10% |
+| `SNIPER_MIN_SCORE` | 70 | Minimum score for Raydium sniper to execute a buy |
+| `PUMPFUN_MIN_SCORE` | 65 | Minimum score for Pump.fun module to execute a buy |
 
 > **Tip:** Start with `MAX_BUY_SOL=0.01` for testing. Increase only after verifying the bot works correctly with your filters.
 
@@ -562,6 +611,7 @@ solana-memecoin-bot/
     ├── core/
     │   ├── connection.ts         # Solana RPC connection + wallet keypair
     │   ├── jupiter.ts            # Jupiter Aggregator swap (buy/sell)
+    │   ├── pumpSwap.ts           # Pump.fun bonding curve direct swap
     │   ├── alerts.ts             # Telegram alert formatting and sending
     │   └── storage.ts            # JSON file persistence layer
     │
@@ -825,9 +875,15 @@ Signal Detected (any module)
          ▼
 ┌─────────────────┐
 │ Calculate Score  │──── < threshold ──── Alert only (no buy)
-│ (0-100)          │
+│ (0-100, base 0) │
 └────────┬────────┘
          │ ≥ threshold
+         ▼
+┌─────────────────┐
+│ Check Positions  │──── Max reached ──── Skip (log & continue)
+│ (max 5 open)     │
+└────────┬────────┘
+         │ Slots available
          ▼
 ┌─────────────────┐
 │ Get Jupiter Quote│
@@ -846,12 +902,12 @@ Signal Detected (any module)
 │ (skipPreflight)  │
 └────────┬────────┘
          │
-         ├──────────────────────┐
-         ▼                      ▼
-┌─────────────────┐  ┌──────────────────┐
-│ Telegram Alert   │  │ Persist to disk  │
-│ + Dashboard WS   │  │ (trades.json)    │
-└─────────────────┘  └──────────────────┘
+         ├──────────────────────┬──────────────────────┐
+         ▼                      ▼                      ▼
+┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ Telegram Alert   │  │ Persist to disk  │  │ Register Position│
+│ + Dashboard WS   │  │ (trades.json)    │  │ (TP/SL/trailing) │
+└─────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
 ### Jupiter Swap
@@ -983,11 +1039,14 @@ const myStrategy = {
 
 | Risk | Protection |
 |------|-----------|
-| **Rug pulls** | Mint authority check, LP burn check, holder concentration |
-| **Honeypots** | Slippage limits, sell simulation (via Jupiter) |
-| **Wash trading** | Unique trader count, buy/sell ratio analysis |
-| **Serial scammers** | Creator history tracking, auto-blacklisting (persisted) |
+| **Rug pulls** | Mint authority check, freeze authority check, LP burn check, holder concentration |
+| **Honeypots** | Slippage limits, sell simulation (via Jupiter), buy/sell pattern detection (5+ buys with 0 sells) |
+| **Wash trading** | Unique trader count, buy/sell ratio analysis, volume-weighted B/S ratio |
+| **Serial scammers** | Creator history tracking, auto-blacklisting (persisted), blacklist check on every token |
 | **Low liquidity** | Minimum liquidity filters, liquidity/mcap ratio |
+| **API failures** | Fail-closed defaults — API errors assume unsafe (mintable, 100% holder concentration) |
+| **Overexposure** | Max concurrent positions limit (default 5), per-module position checks |
+| **Slow bleeds** | Trailing stop locks in profits, time-based exit closes stale positions |
 
 ### What the Filters Cannot Protect Against
 
