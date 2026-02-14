@@ -16,7 +16,8 @@ A fully automated trading bot for Solana memecoins. Snipes new tokens on Raydium
   - [Social Sentiment](#5-social-sentiment)
   - [Position Manager](#6-position-manager)
   - [Backtester](#7-backtester)
-  - [Web Dashboard](#8-web-dashboard)
+  - [Bundle Manager](#8-bundle-manager)
+  - [Web Dashboard](#9-web-dashboard)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -44,7 +45,7 @@ A fully automated trading bot for Solana memecoins. Snipes new tokens on Raydium
 
 ## Overview
 
-This bot combines six trading strategies into a single system:
+This bot combines seven trading modules into a single system:
 
 | Strategy | What it does | Speed |
 |----------|-------------|-------|
@@ -54,6 +55,7 @@ This bot combines six trading strategies into a single system:
 | **Token Monitor** | Scores trending tokens using on-chain data (safety, liquidity, holders, momentum) | Continuous |
 | **Social Sentiment** | Tracks Twitter/X mentions, influencer calls, DexScreener boosts, and emerging narratives | Continuous |
 | **Position Manager** | Monitors open positions with TP, SL, trailing stop, and time-based exits — executes real sells via Jupiter | Every 5s |
+| **Bundle Manager** | Multi-wallet token buying: generates temp wallets, distributes SOL, buys from multiple wallets, consolidates and sells from main | User-driven |
 
 All signals are sent to **Telegram** in real time. The **web dashboard** at `http://localhost:3000` gives you a visual overview of everything. All state is **persisted to disk** — the bot survives restarts without losing data.
 
@@ -353,7 +355,37 @@ Tests trading strategies against historical data before risking real money.
 
 ---
 
-### 8. Web Dashboard
+### 8. Bundle Manager
+
+**File:** `src/modules/bundleManager.ts`
+
+Multi-wallet token buying for distributing buys across many wallets. Controlled entirely from the dashboard — no background polling.
+
+**Lifecycle:**
+
+| Step | Action | Details |
+|------|--------|---------|
+| **Create** | Generate wallets | Creates 1-30 fresh Keypairs, randomly allocates SOL via broken-stick method (min 0.001 SOL each) |
+| **Distribute** | Fund wallets | Batched `SystemProgram.transfer` from main wallet (7 transfers per TX to stay within size limits) |
+| **Buy** | Execute buys | Each sub-wallet gets its own `JupiterSwap` instance and buys sequentially (500ms delay for RPC rate limits) |
+| **Sell** | Consolidate + sell + reclaim | One-click: transfers all tokens to main ATA, sells via Jupiter, sweeps leftover SOL back |
+| **Cancel** | Emergency exit | Attempts consolidate → sell → reclaim, force-clears state if anything fails |
+
+**Key design decisions:**
+- **Fresh wallets each time** — Keypairs are generated per bundle and discarded after reclaim
+- **Consolidate-then-sell** — All tokens are transferred to the main wallet ATA, then sold in a single Jupiter swap (better price than individual sells)
+- **Auto-reclaim SOL** — After selling, each sub-wallet sends its remaining SOL (minus 5000 lamports rent) back to the main wallet
+- **Crash recovery** — State persists to `data/bundle.json`. Each phase checks per-wallet flags (`distributed`, `bought`, `consolidated`, `reclaimed`) and skips already-completed wallets, making operations idempotent and resumable
+- **Secret keys never exposed** — `getStatus()` strips `secretKeyB58` from wallet data before sending to the dashboard
+
+**Constants:**
+- `SOL_FEE_BUFFER`: 0.003 SOL per wallet (covers TX fees)
+- `MAX_WALLETS`: 30
+- `TRANSFERS_PER_TX`: 7 (Solana TX size limit)
+
+---
+
+### 9. Web Dashboard
 
 **File:** `src/dashboard/server.ts`
 
@@ -369,6 +401,7 @@ Express + WebSocket server serving a real-time single-page dashboard.
 - Active narratives display from Social Sentiment module
 - Pump.fun and Social module statistics
 - Blacklist and influencer management via API
+- Bundle Manager card — create bundles, step through distribute/buy/sell with per-wallet progress table
 - Storage statistics endpoint
 
 **Endpoints:** See [API Reference](#api-reference-dashboard).
@@ -601,6 +634,7 @@ solana-memecoin-bot/
 │   ├── influencers.json          # Social influencer list
 │   ├── narratives.json           # Active narratives
 │   ├── performance.json          # Balance history (max 10000)
+│   ├── bundle.json               # Active bundle state
 │   └── backtest/                 # Backtest data and results
 │
 └── src/
@@ -622,6 +656,7 @@ solana-memecoin-bot/
     │   ├── tokenMonitor.ts       # On-chain token scoring
     │   ├── socialSentiment.ts    # Twitter/social monitoring
     │   ├── positionManager.ts    # Take-profit / stop-loss manager
+    │   ├── bundleManager.ts      # Multi-wallet bundle buying
     │   └── backtester.ts         # Strategy backtesting engine
     │
     ├── dashboard/
@@ -650,6 +685,7 @@ All bot state is persisted to JSON files in the `data/` directory. The bot survi
 | `influencers.json` | Twitter/social influencer list | Unlimited | ✅ Loaded into Social module |
 | `narratives.json` | Active narrative keywords (< 6h old) | Unlimited | ✅ Loaded into Social module |
 | `performance.json` | Balance history over time | 10,000 | ✅ Shown in dashboard chart |
+| `bundle.json` | Active bundle state (wallets, phase flags) | 1 object | ✅ Resumes bundle operations |
 
 ### How It Works
 
@@ -847,6 +883,42 @@ Returns file sizes and entry counts for all persisted data.
 
 Returns balance history for the equity chart.
 
+### GET `/api/bundle/status`
+
+Returns current bundle state (wallets, status, phase flags). Secret keys are stripped. Returns `null` if no active bundle.
+
+### POST `/api/bundle/create`
+
+Create a new bundle. Generates fresh wallets and allocates SOL.
+
+```json
+{
+  "mint": "TokenMintAddress...",
+  "walletCount": 5,
+  "totalSol": 0.5
+}
+```
+
+### POST `/api/bundle/distribute`
+
+Fund all sub-wallets from main wallet. Returns 200 immediately; runs async with WebSocket progress updates.
+
+### POST `/api/bundle/buy`
+
+Execute buys from all sub-wallets. Returns 200 immediately; runs async.
+
+### POST `/api/bundle/sell`
+
+One-click sell flow: consolidate tokens to main wallet → sell via Jupiter → reclaim SOL. Returns 200 immediately; runs async.
+
+### POST `/api/bundle/cancel`
+
+Emergency cancel: attempts to salvage funds (consolidate + sell + reclaim), then force-clears state.
+
+### POST `/api/bundle/reclaim`
+
+Standalone SOL reclaim from sub-wallets back to main wallet.
+
 ### WebSocket
 
 Connect to `ws://localhost:3000` for real-time events:
@@ -855,6 +927,7 @@ Connect to `ws://localhost:3000` for real-time events:
 { "type": "alert", "data": { "time": 1234567890, "type": "snipe", "message": "..." } }
 { "type": "trade", "data": { "action": "BUY", "mint": "...", "amount": 0.1 } }
 { "type": "performance", "data": { "time": 1234567890, "balanceSol": 1.54 } }
+{ "type": "bundle", "data": { "mint": "...", "status": "buying", "wallets": [...] } }
 ```
 
 ---

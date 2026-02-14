@@ -17,7 +17,7 @@ npx tsc --noEmit       # Type-check without emitting (no linter/test framework c
 
 ## Architecture
 
-This is a Solana memecoin trading bot built with TypeScript. It runs six concurrent trading modules orchestrated by `src/index.ts`, with a web dashboard and Telegram alerts.
+This is a Solana memecoin trading bot built with TypeScript. It runs seven concurrent trading modules orchestrated by `src/index.ts`, with a web dashboard and Telegram alerts.
 
 ### Core Layer (`src/core/`)
 
@@ -29,7 +29,7 @@ This is a Solana memecoin trading bot built with TypeScript. It runs six concurr
 
 ### Module Layer (`src/modules/`)
 
-All modules are classes with a `start()` method. They are instantiated and started in parallel by `index.ts`.
+All modules are classes with a `start()` method (except `BundleManager`, which is user-driven). They are instantiated and started in parallel by `index.ts`.
 
 - **sniper.ts** — `SniperModule`: Polls Helius for Raydium AMM (`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`) new pool transactions. Scores tokens 0-100 with safety filters (liquidity, holders, mint/freeze authority, blacklist). Buys via Jupiter if score >= 70.
 - **pumpfun.ts** — `PumpFunModule`: Connects to Pump.fun WebSocket (`wss://pumpportal.fun/api/data`). Four strategies: earlySnipe, bondingCurvePlay, migrationSnipe, socialMomentum. Buys via PumpSwap (on-curve) or Jupiter (post-migration). Auto-blacklists serial deployers.
@@ -38,14 +38,15 @@ All modules are classes with a `start()` method. They are instantiated and start
 - **socialSentiment.ts** — `SocialSentimentModule`: Twitter API (optional), DexScreener boosts, Birdeye social scores. Detects influencer calls, narrative emergence, and trend velocity spikes. Persists influencers and narratives to disk.
 - **positionManager.ts** — `PositionManager`: Monitors open positions every 10s. Enforces TP (default +100%) and SL (default -50%). Positions persist across restarts.
 - **backtester.ts** — `Backtester`: Tests strategies against historical Birdeye data. Calculates win rate, Sharpe ratio, max drawdown.
+- **bundleManager.ts** — `BundleManager`: Multi-wallet token buying. Generates fresh temp wallets, distributes SOL, each wallet buys via Jupiter, then consolidates tokens to main wallet for a single sell. User-driven (no `start()` method) — controlled via dashboard REST API. Persists state to `data/bundle.json` for crash recovery. Each phase (distribute, buy, consolidate, sell, reclaim) is idempotent and resumable.
 
 ### Dashboard (`src/dashboard/server.ts`)
 
-Express + WebSocket server. REST API on `DASHBOARD_PORT` (default 3000). Real-time alerts via WS. Endpoints for positions, trades, config, wallets, blacklist, influencers, storage stats. Config changes via POST persist to `data/config.json` and override `.env` values.
+Express + WebSocket server. REST API on `DASHBOARD_PORT` (default 3000). Real-time alerts via WS. Endpoints for positions, trades, config, wallets, blacklist, influencers, storage stats, and bundle management. Config changes via POST persist to `data/config.json` and override `.env` values. Bundle operations are async — long-running ops return 200 immediately and broadcast progress via WebSocket `type: 'bundle'`.
 
 ### Shared Types (`src/types.ts`)
 
-Key interfaces: `TokenInfo`, `TradeSignal` (types: SNIPE/COPY/FILTER), `Position`, `WalletConfig`.
+Key interfaces: `TokenInfo`, `TradeSignal` (types: SNIPE/COPY/FILTER), `Position`, `WalletConfig`, `BundleState`, `BundleWallet`, `BundleStatus`.
 
 ### Config Priority
 
@@ -54,7 +55,7 @@ Key interfaces: `TokenInfo`, `TradeSignal` (types: SNIPE/COPY/FILTER), `Position
 ## Key Patterns
 
 - **Two swap paths**: Jupiter (post-Raydium-migration tokens) and PumpSwap (bonding curve tokens). Modules choose based on whether the token has completed its bonding curve.
-- **All state in `./data/*.json`**: Config, wallets, positions, trades, alerts, blacklist, influencers, narratives, performance. The `data/` directory is gitignored.
+- **All state in `./data/*.json`**: Config, wallets, positions, trades, alerts, blacklist, influencers, narratives, performance, bundle. The `data/` directory is gitignored.
 - **Graceful shutdown**: SIGINT/SIGTERM handlers flush storage. `uncaughtException` also flushes before exit.
 - **Polling, not WebSocket subscriptions for Solana RPC**: Sniper uses `getSignaturesForAddress` polling (despite originally being designed for WS). Pump.fun module uses its own WebSocket to `pumpportal.fun`.
 
