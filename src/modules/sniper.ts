@@ -5,15 +5,18 @@ import { sendAlert, formatTradeAlert } from '../core/alerts';
 import { storage } from '../core/storage';
 import { CONFIG } from '../config';
 import { TokenInfo, TradeSignal } from '../types';
+import { PositionManager } from './positionManager';
 
 const RAYDIUM_AMM = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
 
 export class SniperModule {
   private jupiter: JupiterSwap;
-  private processedPools = new Set<string>();
+  private processedSignatures = new Set<string>();
+  private processedMints = new Set<string>();
   private lastSignature: string | undefined;
   private pollInterval = 3000;
   private apiErrors = { helius: 0, birdeye: 0 };
+  private positionManager: PositionManager | null = null;
 
   private filters = {
     minLiquiditySOL: 5, maxTopHolderPct: 30, requireMintRevoked: true,
@@ -21,8 +24,9 @@ export class SniperModule {
     blacklistedDevs: new Set<string>(),
   };
 
-  constructor() {
+  constructor(positionManager?: PositionManager) {
     this.jupiter = new JupiterSwap(connection, wallet);
+    this.positionManager = positionManager || null;
     this.filters.blacklistedDevs = storage.getBlacklistSet();
     if (this.filters.blacklistedDevs.size > 0)
       console.log(`🎯 Loaded ${this.filters.blacklistedDevs.size} blacklisted devs`);
@@ -32,6 +36,7 @@ export class SniperModule {
     console.log('🎯 Sniper Module started (polling mode)');
     await this.validateApis();
     this.pollRaydium();
+    this.startCleanupTimer();
   }
 
   // ══════════════════════════════
@@ -81,8 +86,8 @@ export class SniperModule {
         if (sigs.length > 0) {
           this.lastSignature = sigs[0].signature;
           for (const sig of sigs.reverse()) {
-            if (this.processedPools.has(sig.signature)) continue;
-            this.processedPools.add(sig.signature);
+            if (this.processedSignatures.has(sig.signature)) continue;
+            this.processedSignatures.add(sig.signature);
             await this.processTransaction(sig.signature);
           }
         }
@@ -111,8 +116,8 @@ export class SniperModule {
       const unique = [...new Set(newMints)];
 
       for (const mint of unique) {
-        if (this.processedPools.has(mint)) continue;
-        this.processedPools.add(mint);
+        if (this.processedMints.has(mint)) continue;
+        this.processedMints.add(mint);
         console.log(`\n🆕 Raydium new pool: ${mint}`);
         await this.evaluateAndBuy(mint);
       }
@@ -137,7 +142,7 @@ export class SniperModule {
       return;
     }
 
-    console.log(`  ✅ PASSED — Score: ${result.score}/100`);
+    console.log(`  ✅ PASSED — Score: ${result.score}/100 (threshold: ${CONFIG.trading.sniperMinScore})`);
 
     const signal: TradeSignal = {
       type: 'SNIPE', action: 'BUY', mint,
@@ -147,7 +152,13 @@ export class SniperModule {
 
     await sendAlert(formatTradeAlert(signal));
 
-    if (signal.confidence >= 50) {
+    if (signal.confidence >= CONFIG.trading.sniperMinScore) {
+      // Check max positions before buying
+      if (this.positionManager && !this.positionManager.canOpenPosition()) {
+        console.log(`  ⏭️  Max positions (${CONFIG.trading.maxPositions}) reached — skipping buy`);
+        return;
+      }
+
       console.log(`  💰 Executing buy: ${CONFIG.trading.maxBuySol} SOL...`);
       const tx = await this.jupiter.buy(mint, CONFIG.trading.maxBuySol);
       if (tx) {
@@ -158,45 +169,88 @@ export class SniperModule {
           symbol: tokenInfo.symbol, amountSol: CONFIG.trading.maxBuySol,
           price: 0, tx, source: 'SNIPE',
         });
+
+        // Register position with PositionManager
+        if (this.positionManager) {
+          const price = await this.jupiter.getPrice(mint);
+          this.positionManager.addPosition({
+            mint, symbol: tokenInfo.symbol, entryPrice: price,
+            amount: CONFIG.trading.maxBuySol, entryTime: Date.now(), source: 'SNIPE',
+          });
+        }
       } else {
         console.log(`  ❌ BUY FAILED (Jupiter error)`);
       }
     } else {
-      console.log(`  ⏭️  Score ${result.score} < 50 — alert only`);
+      console.log(`  ⏭️  Score ${result.score} < ${CONFIG.trading.sniperMinScore} — alert only`);
     }
   }
 
   // ══════════════════════════════
-  // Filters
+  // Filters — base 0, threshold from config
   // ══════════════════════════════
   private applyFiltersWithLog(token: TokenInfo): { passed: boolean; reason: string; score: number } {
-    let score = 50, passed = true, fail = '';
+    let score = 0, passed = true, fail = '';
 
+    // Blacklist check — instant reject
+    if (token.creator && this.filters.blacklistedDevs.has(token.creator)) {
+      console.log(`  ❌ Blacklisted dev: ${token.creator.slice(0, 8)}...`);
+      return { passed: false, reason: 'Blacklisted dev', score: 0 };
+    }
+
+    // Age check — reject tokens older than maxAgeSeconds
+    const ageSec = (Date.now() - token.createdAt) / 1000;
+    if (ageSec > this.filters.maxAgeSeconds) {
+      console.log(`  ❌ Token too old: ${ageSec.toFixed(0)}s (max: ${this.filters.maxAgeSeconds}s)`);
+      return { passed: false, reason: `Token too old: ${ageSec.toFixed(0)}s`, score: 0 };
+    }
+
+    // Liquidity: max 20pts — needs 100 SOL for max
     const liqOk = token.liquidity >= this.filters.minLiquiditySOL;
     console.log(`  ${liqOk ? '✅' : '❌'} Liquidity: ${token.liquidity.toFixed(1)} SOL (min: ${this.filters.minLiquiditySOL})`);
     if (!liqOk) { passed = false; fail = 'Liquidez baixa'; }
-    else score += Math.min(20, token.liquidity / 2);
+    else score += Math.min(20, Math.floor(token.liquidity / 5));
 
-    const holderOk = token.topHolderPct <= this.filters.maxTopHolderPct || token.topHolderPct === 0;
+    // Top holder: max 15pts
+    const holderOk = token.topHolderPct <= this.filters.maxTopHolderPct;
     console.log(`  ${holderOk ? '✅' : '❌'} Top holder: ${token.topHolderPct.toFixed(1)}% (max: ${this.filters.maxTopHolderPct}%)`);
     if (!holderOk && passed) { passed = false; fail = `Top holder: ${token.topHolderPct}%`; }
-    else if (holderOk) score += (30 - token.topHolderPct) / 2;
+    else if (holderOk) score += Math.min(15, Math.floor((30 - token.topHolderPct) / 2));
 
+    // Mint renounced: +15
     const mintOk = !this.filters.requireMintRevoked || !token.isMintable;
     console.log(`  ${mintOk ? '✅' : '❌'} Mint renounced: ${token.isRenounced ? 'YES' : 'NO'}`);
     if (!mintOk && passed) { passed = false; fail = 'Mint não revogada'; }
-    if (token.isRenounced) score += 10;
+    if (token.isRenounced) score += 15;
 
+    // Freeze authority revoked: +10
+    const freezeOk = !this.filters.requireFreezeRevoked || token.freezeAuthority === null;
+    console.log(`  ${freezeOk ? '✅' : '❌'} Freeze revoked: ${token.freezeAuthority === null ? 'YES' : token.freezeAuthority === undefined ? 'UNKNOWN' : 'NO'}`);
+    if (!freezeOk && passed) { passed = false; fail = 'Freeze authority ativa'; }
+    if (token.freezeAuthority === null) score += 10;
+
+    // Holders: max 15pts — needs 300 for max
     const holdersOk = token.holders >= this.filters.minHolders;
     console.log(`  ${holdersOk ? '✅' : '❌'} Holders: ${token.holders} (min: ${this.filters.minHolders})`);
     if (!holdersOk && passed) { passed = false; fail = `Poucos holders: ${token.holders}`; }
-    else if (holdersOk) score += Math.min(10, token.holders / 10);
+    else if (holdersOk) score += Math.min(15, Math.floor(token.holders / 20));
 
+    // LP burned: +10
     console.log(`  ℹ️  LP burned: ${token.lpBurned ? 'YES' : 'UNKNOWN'}`);
+    if (token.lpBurned) score += 10;
+
+    // Fresh token bonus: +10 if < 120s old
+    if (ageSec < 120) {
+      score += 10;
+      console.log(`  ✅ Fresh token: ${ageSec.toFixed(0)}s old (+10)`);
+    } else {
+      console.log(`  ℹ️  Token age: ${ageSec.toFixed(0)}s`);
+    }
+
     console.log(`  ℹ️  MCap: $${token.marketCap.toLocaleString()}`);
 
     const s = Math.min(100, Math.round(score));
-    console.log(`  🧮 Score: ${s}/100`);
+    console.log(`  🧮 Score: ${s}/100 (threshold: ${CONFIG.trading.sniperMinScore})`);
 
     return passed ? { passed: true, reason: 'OK', score: s } : { passed: false, reason: fail, score: s };
   }
@@ -242,9 +296,12 @@ export class SniperModule {
         holders: birdeye?.holder || 0,
         topHolderPct: topHolder,
         createdAt: Date.now(),
-        isRenounced: helius?.mintAuthority === null,
-        isMintable: helius ? helius.mintAuthority !== null : false,
+        // Fail-closed: if Helius fails, assume mintable (unsafe)
+        isRenounced: helius ? helius.mintAuthority === null : false,
+        isMintable: helius ? helius.mintAuthority !== null : true,
         lpBurned: false,
+        // Extract freeze authority from Helius data
+        freezeAuthority: helius ? (helius.freezeAuthority || null) : undefined,
       };
     } catch (err: any) {
       console.error(`  ❌ analyzeToken error: ${err.message}`);
@@ -298,7 +355,8 @@ export class SniperModule {
       });
       if (!res.ok) {
         console.error(`  ⚠️  Birdeye holders HTTP ${res.status}`);
-        return 0;
+        // Fail-closed: assume worst case on HTTP error
+        return 100;
       }
       const data = await res.json() as any;
       return data?.data?.items?.[0]?.percentage || 0;
@@ -306,5 +364,25 @@ export class SniperModule {
       console.error(`  ⚠️  Top holder check error: ${err.message}`);
       return 100;
     }
+  }
+
+  // ══════════════════════════════
+  // Memory cleanup
+  // ══════════════════════════════
+  private startCleanupTimer() {
+    setInterval(() => {
+      // Cap processedSignatures at 10k
+      if (this.processedSignatures.size > 10000) {
+        const arr = Array.from(this.processedSignatures);
+        this.processedSignatures = new Set(arr.slice(arr.length - 5000));
+        console.log(`🎯 Trimmed processedSignatures: ${arr.length} → ${this.processedSignatures.size}`);
+      }
+      // Cap processedMints at 10k
+      if (this.processedMints.size > 10000) {
+        const arr = Array.from(this.processedMints);
+        this.processedMints = new Set(arr.slice(arr.length - 5000));
+        console.log(`🎯 Trimmed processedMints: ${arr.length} → ${this.processedMints.size}`);
+      }
+    }, 10 * 60 * 1000); // every 10 minutes
   }
 }

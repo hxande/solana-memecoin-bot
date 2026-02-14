@@ -18,5 +18,11 @@ export const CONFIG = {
     profitTarget: parseFloat(process.env.AUTO_SELL_PROFIT_PCT || '100'),
     stopLoss: parseFloat(process.env.STOP_LOSS_PCT || '50'),
     priorityFee: parseFloat(process.env.GAS_PRIORITY_FEE || '0.005'),
+    maxPositions: parseInt(process.env.MAX_POSITIONS || '5'),
+    trailingStopPct: parseFloat(process.env.TRAILING_STOP_PCT || '30'),
+    trailingActivationPct: parseFloat(process.env.TRAILING_ACTIVATION_PCT || '30'),
+    maxHoldTimeMinutes: parseInt(process.env.MAX_HOLD_TIME_MINUTES || '30'),
+    sniperMinScore: parseInt(process.env.SNIPER_MIN_SCORE || '70'),
+    pumpfunMinScore: parseInt(process.env.PUMPFUN_MIN_SCORE || '65'),
   },
 };

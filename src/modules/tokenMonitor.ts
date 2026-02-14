@@ -53,10 +53,10 @@ export class TokenMonitor {
     }
     if (token.marketCap < 1_000_000) liquidity += 5;
 
+    // Tiered holder scoring (removed unconditional +10)
     if (token.holders >= 500) community += 15;
     else if (token.holders >= 100) community += 10;
     else if (token.holders >= 30) community += 5;
-    community += 10;
 
     const priceData = await this.getRecentPriceAction(token.mint);
     if (priceData) {
@@ -73,13 +73,43 @@ export class TokenMonitor {
         'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20',
         { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } }
       );
-      return (res.data.data?.tokens || []).map((t: any) => ({
-        mint: t.address, symbol: t.symbol || 'UNKNOWN', name: t.name || '',
-        decimals: t.decimals || 9, poolAddress: '', liquidity: t.liquidity || 0,
-        marketCap: t.mc || 0, holders: t.holder || 0, topHolderPct: 0,
-        createdAt: 0, isRenounced: false, isMintable: false, lpBurned: false,
-      }));
-    } catch { return []; }
+      const tokens: TokenInfo[] = [];
+      for (const t of (res.data.data?.tokens || [])) {
+        // Fetch token overview to get actual topHolderPct and safety data
+        let topHolderPct = 0;
+        let isRenounced = false;
+        let isMintable = true;
+        try {
+          const overviewRes = await axios.get(
+            `https://public-api.birdeye.so/defi/token_overview?address=${t.address}`,
+            { headers: { 'X-API-KEY': CONFIG.birdeyeKey, 'x-chain': 'solana' } }
+          );
+          const overview = overviewRes.data?.data;
+          if (overview) {
+            // Use top10HolderPercent if available, or top holder from holder endpoint
+            topHolderPct = overview.top10HolderPercent || 0;
+            // Some Birdeye overview data includes owner info
+            if (overview.owner === null || overview.owner === '') {
+              isRenounced = true;
+              isMintable = false;
+            }
+          }
+        } catch {
+          // Use defaults — fail-closed (isMintable remains true)
+        }
+
+        tokens.push({
+          mint: t.address, symbol: t.symbol || 'UNKNOWN', name: t.name || '',
+          decimals: t.decimals || 9, poolAddress: '', liquidity: t.liquidity || 0,
+          marketCap: t.mc || 0, holders: t.holder || 0, topHolderPct,
+          createdAt: 0, isRenounced, isMintable, lpBurned: false,
+        });
+      }
+      return tokens;
+    } catch (err: any) {
+      console.error(`📊 Trending fetch error: ${err.message}`);
+      return [];
+    }
   }
 
   private async getRecentPriceAction(mint: string): Promise<{ priceChange1h: number; volumeChange: number } | null> {

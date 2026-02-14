@@ -33,12 +33,12 @@ async function main() {
   }
   console.log('');
 
-  // Init modules
-  const sniper = new SniperModule();
+  // Init modules — PositionManager first so it can be shared
+  const positions = new PositionManager();
+  const sniper = new SniperModule(positions);
   const tracker = new WalletTracker();
   const monitor = new TokenMonitor();
-  const positions = new PositionManager();
-  const pumpfun = new PumpFunModule();
+  const pumpfun = new PumpFunModule(positions);
   const social = new SocialSentimentModule();
   const backtester = new Backtester();
 

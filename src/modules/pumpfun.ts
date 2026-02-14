@@ -7,6 +7,7 @@ import { PumpSwap } from '../core/pumpSwap';
 import { sendAlert } from '../core/alerts';
 import { storage } from '../core/storage';
 import { CONFIG } from '../config';
+import { PositionManager } from './positionManager';
 
 const PUMP_FUN_API = 'https://frontend-api.pump.fun';
 const PUMP_FUN_WS = 'wss://pumpportal.fun/api/data';
@@ -45,6 +46,7 @@ export class PumpFunModule {
   private creatorHistory = new Map<string, string[]>();
   private wsTokenCache = new Map<string, WSTokenData>();
   private apiWorking = true;
+  private positionManager: PositionManager | null = null;
 
   private filters = {
     minReplies: 0,
@@ -58,9 +60,10 @@ export class PumpFunModule {
     excludedKeywords: ['rug', 'scam', 'test', 'airdrop'],
   };
 
-  constructor() {
+  constructor(positionManager?: PositionManager) {
     this.jupiter = new JupiterSwap(connection, wallet);
     this.pumpSwap = new PumpSwap(connection, wallet);
+    this.positionManager = positionManager || null;
     const bl = storage.getBlacklistSet();
     this.filters.blacklistedCreators = bl;
     if (bl.size > 0) console.log(`🟣 Loaded ${bl.size} blacklisted creators`);
@@ -71,6 +74,7 @@ export class PumpFunModule {
     await this.testApi();
     this.connectWebSocket();
     if (this.apiWorking) this.startBondingCurveMonitor();
+    this.startCleanupTimer();
   }
 
   // ══════════════════════════════
@@ -189,7 +193,7 @@ export class PumpFunModule {
   }
 
   // ══════════════════════════════
-  // Evaluate Token
+  // Evaluate Token — tightened scoring
   // ══════════════════════════════
   private async evaluateToken(mint: string): Promise<number> {
     if (this.processedMints.has(mint)) return 0;
@@ -251,7 +255,8 @@ export class PumpFunModule {
       if (mcapSol === 0) {
         checks.push(`  ⚠️ MCap: unknown`);
       } else {
-        if (mcapSol >= 5 && mcapSol <= 30) { score += 15; reasons.push(`MCap: ${mcapSol.toFixed(1)} SOL`); }
+        // Reduced: +10 for sweet spot (was +15)
+        if (mcapSol >= 5 && mcapSol <= 30) { score += 10; reasons.push(`MCap: ${mcapSol.toFixed(1)} SOL`); }
         checks.push(`  ${mcapSol >= 5 && mcapSol <= 30 ? '✅' : 'ℹ️'} MCap: ${mcapSol.toFixed(2)} SOL`);
       }
 
@@ -264,30 +269,42 @@ export class PumpFunModule {
         checks.push(`  ℹ️  Replies: N/A`);
       }
 
-      // 4. Trades
+      // 4. Trades — tightened scoring
       const trades = this.tokenTradeHistory.get(mint) || [];
       const buys = trades.filter(t => t.is_buy);
       const sells = trades.filter(t => !t.is_buy);
       const uniqueTraders = new Set(trades.map(t => t.user)).size;
 
-      if (buys.length >= this.filters.minBuyCount) { score += 10; reasons.push(`${buys.length} buys`); }
-      checks.push(`  ${buys.length >= this.filters.minBuyCount ? '✅' : '⚠️'} Buys: ${buys.length} (min: ${this.filters.minBuyCount})`);
+      // Buys: tiered scoring (was flat +10 at 3)
+      if (buys.length >= 8) { score += 10; reasons.push(`${buys.length} buys`); }
+      else if (buys.length >= this.filters.minBuyCount) { score += 5; reasons.push(`${buys.length} buys`); }
+      checks.push(`  ${buys.length >= 8 ? '✅' : buys.length >= this.filters.minBuyCount ? 'ℹ️' : '⚠️'} Buys: ${buys.length} (min: ${this.filters.minBuyCount})`);
 
-      if (uniqueTraders >= this.filters.minUniqueTraders) { score += 10; reasons.push(`${uniqueTraders} traders`); }
-      checks.push(`  ${uniqueTraders >= this.filters.minUniqueTraders ? '✅' : '⚠️'} Traders: ${uniqueTraders} (min: ${this.filters.minUniqueTraders})`);
+      // Unique traders: tiered (was flat +10 at 2)
+      if (uniqueTraders >= 5) { score += 10; reasons.push(`${uniqueTraders} traders`); }
+      else if (uniqueTraders >= this.filters.minUniqueTraders) { score += 5; reasons.push(`${uniqueTraders} traders`); }
+      checks.push(`  ${uniqueTraders >= 5 ? '✅' : uniqueTraders >= this.filters.minUniqueTraders ? 'ℹ️' : '⚠️'} Traders: ${uniqueTraders} (min: ${this.filters.minUniqueTraders})`);
 
-      // 5. Buy/sell ratio
+      // 5. Buy/sell ratio (count-based)
       const ratio = sells.length > 0 ? buys.length / sells.length : buys.length;
       if (ratio >= 3) { score += 15; reasons.push(`B/S: ${ratio.toFixed(1)}`); }
       else if (ratio >= 1.5) { score += 8; }
-      checks.push(`  ${ratio >= 3 ? '✅' : ratio >= 1.5 ? 'ℹ️' : '⚠️'} B/S: ${ratio.toFixed(1)} (${buys.length}b/${sells.length}s)`);
+      checks.push(`  ${ratio >= 3 ? '✅' : ratio >= 1.5 ? 'ℹ️' : '⚠️'} B/S count: ${ratio.toFixed(1)} (${buys.length}b/${sells.length}s)`);
 
-      // 6. Volume
-      const vol = buys.reduce((s, t) => s + (t.sol_amount || 0), 0);
+      // Volume-weighted B/S ratio
+      const buyVolSol = buys.reduce((s, t) => s + (t.sol_amount || 0), 0);
+      const sellVolSol = sells.reduce((s, t) => s + (t.sol_amount || 0), 0);
+      if (sellVolSol > 0 && sellVolSol > 2 * buyVolSol) {
+        score -= 15;
+        checks.push(`  ❌ Sell volume ${sellVolSol.toFixed(2)} SOL > 2x buy volume ${buyVolSol.toFixed(2)} SOL (-15)`);
+      }
+
+      // 6. Volume — require minimum 1 SOL total
+      const vol = buyVolSol;
       if (vol >= 1) { score += 5; reasons.push(`Vol: ${vol.toFixed(1)} SOL`); }
       checks.push(`  ${vol >= 1 ? '✅' : 'ℹ️'} Volume: ${vol.toFixed(2)} SOL`);
 
-      // 7. Creator holdings
+      // 7. Creator holdings — use actual token supply
       const creator = tokenData.creator;
       if (creator) {
         const holdPct = await this.getCreatorHoldingPct(mint, creator);
@@ -296,23 +313,39 @@ export class PumpFunModule {
         checks.push(`  ${holdPct <= 10 ? '✅' : holdPct <= this.filters.maxCreatorHoldPct ? 'ℹ️' : '❌'} Creator: ${holdPct.toFixed(1)}%`);
       }
 
-      // 8. Bonding curve
+      // 8. Bonding curve — reduced from +15 to +10
       const bcPct = mcapSol > 0 ? Math.min(100, (mcapSol / 85) * 100) : 0;
-      if (bcPct >= 60 && bcPct <= 85) { score += 15; reasons.push(`BC: ${bcPct.toFixed(0)}%`); }
+      if (bcPct >= 60 && bcPct <= 85) { score += 10; reasons.push(`BC: ${bcPct.toFixed(0)}%`); }
       checks.push(`  ${bcPct >= 60 && bcPct <= 85 ? '✅' : 'ℹ️'} BC: ${bcPct.toFixed(1)}%`);
 
+      // 9. Honeypot check: if > 30s of trading with 5+ buys and 0 sells, penalize
+      if (trades.length > 0) {
+        const tradingDurationSec = (Date.now() / 1000) - trades[0].timestamp;
+        if (tradingDurationSec > 30 && buys.length >= 5 && sells.length === 0) {
+          score -= 20;
+          checks.push(`  ⚠️ Honeypot signal: ${buys.length} buys, 0 sells in ${tradingDurationSec.toFixed(0)}s (-20)`);
+        }
+      }
+
+      const minScore = CONFIG.trading.pumpfunMinScore;
       console.log(checks.join('\n'));
-      console.log(`  🧮 Score: ${score}/100 (threshold: 50)`);
+      console.log(`  🧮 Score: ${score}/100 (threshold: ${minScore})`);
 
       this.processedMints.add(mint);
 
-      if (score >= 50) {
+      if (score >= minScore) {
+        // Check max positions before buying
+        if (this.positionManager && !this.positionManager.canOpenPosition()) {
+          console.log(`  ⏭️  Max positions (${CONFIG.trading.maxPositions}) reached — skipping buy`);
+          return score;
+        }
+
         console.log(`  ✅ PASSED — ${reasons.join(' | ')}`);
         const buyAmount = this.calculateBuyAmount(score);
         await sendAlert(this.formatPumpAlert(tokenData, mcapSol, bcPct, score, reasons));
         await this.executeBuy(mint, tokenData.symbol, buyAmount, tokenData.complete || false);
       } else {
-        console.log(`  🚫 BLOCKED — Score ${score} < 50`);
+        console.log(`  🚫 BLOCKED — Score ${score} < ${minScore}`);
         if (reasons.length > 0) console.log(`  Positive: ${reasons.join(' | ')}`);
       }
 
@@ -359,6 +392,15 @@ export class PumpFunModule {
         id: tx, time: Date.now(), action: 'BUY', mint, symbol,
         amountSol, price: 0, tx, source: 'SNIPE',
       });
+
+      // Register position with PositionManager
+      if (this.positionManager) {
+        const price = await this.jupiter.getPrice(mint);
+        this.positionManager.addPosition({
+          mint, symbol, entryPrice: price,
+          amount: amountSol, entryTime: Date.now(), source: 'SNIPE',
+        });
+      }
     } else {
       console.log(`  ❌ BUY FAILED [${method}]`);
       await sendAlert(`❌ Buy falhou: ${symbol}\nMint: ${mint}\nRoute: ${method}`);
@@ -376,12 +418,18 @@ export class PumpFunModule {
     console.log(`\n  🚀 MIGRATION approaching: ${symbol} (${trade.market_cap_sol?.toFixed(1)} SOL)`);
     await sendAlert(`🚀 <b>MIGRAÇÃO IMINENTE</b>\n${symbol}\nMint: <code>${mint}</code>\nMCap: ${trade.market_cap_sol?.toFixed(1)} SOL`);
 
+    // Check max positions before migration buy
+    if (this.positionManager && !this.positionManager.canOpenPosition()) {
+      console.log(`  ⏭️  Max positions reached — skipping migration buy`);
+      return;
+    }
+
     const buyAmount = CONFIG.trading.maxBuySol * 0.5;
     await this.executeBuy(mint, symbol, buyAmount, false);
   }
 
   // ══════════════════════════════
-  // Volume surge detection
+  // Volume surge detection — with minimum volume requirement
   // ══════════════════════════════
   private async detectVolumeSurge(mint: string) {
     const trades = this.tokenTradeHistory.get(mint) || [];
@@ -391,9 +439,13 @@ export class PumpFunModule {
     const prev60 = trades.filter(t => { const a = now - t.timestamp * 1000; return a >= 60000 && a < 120000; });
 
     if (last60.length >= 3 * Math.max(prev60.length, 1) && last60.length >= 8) {
+      // Require minimum 1 SOL total volume
+      const totalVol = last60.reduce((s, t) => s + (t.sol_amount || 0), 0);
+      if (totalVol < 1) return;
+
       const buyPct = (last60.filter(t => t.is_buy).length / last60.length) * 100;
       if (buyPct >= 70 && !this.processedMints.has(mint)) {
-        console.log(`\n  🔥 Volume surge: ${mint.slice(0, 8)}... (${last60.length} trades/min, ${buyPct.toFixed(0)}% buys)`);
+        console.log(`\n  🔥 Volume surge: ${mint.slice(0, 8)}... (${last60.length} trades/min, ${buyPct.toFixed(0)}% buys, ${totalVol.toFixed(2)} SOL)`);
         await this.evaluateToken(mint);
       }
     }
@@ -486,10 +538,21 @@ export class PumpFunModule {
       );
       if (accs.value.length === 0) return 0;
       const bal = accs.value[0].account.data.parsed.info.tokenAmount.uiAmount || 0;
-      return (bal / 1_000_000_000) * 100;
+
+      // Get actual token supply instead of hardcoded 1B
+      let totalSupply = 1_000_000_000; // fallback
+      try {
+        const supplyInfo = await connection.getTokenSupply(new PublicKey(mint));
+        totalSupply = parseFloat(supplyInfo.value.uiAmountString || '1000000000');
+      } catch {
+        // Use fallback
+      }
+
+      return (bal / totalSupply) * 100;
     } catch (err: any) {
       console.error(`  ⚠️  Creator hold check error: ${err.message}`);
-      return 0;
+      // Fail-closed: return 50% (suspicious) instead of 0 (safe)
+      return 50;
     }
   }
 
@@ -514,6 +577,36 @@ export class PumpFunModule {
       `📋 ${reasons.join(' | ')}`,
       `<a href="https://pump.fun/${token.mint}">Pump.fun</a> | <a href="https://solscan.io/token/${token.mint}">Solscan</a>`,
     ].join('\n');
+  }
+
+  // ══════════════════════════════
+  // Memory cleanup
+  // ══════════════════════════════
+  private startCleanupTimer() {
+    setInterval(() => {
+      const oneHourAgo = Date.now() - 60 * 60 * 1000;
+
+      // Trim processedMints
+      if (this.processedMints.size > 10000) {
+        const arr = Array.from(this.processedMints);
+        this.processedMints = new Set(arr.slice(arr.length - 5000));
+        console.log(`🟣 Trimmed processedMints: ${arr.length} → ${this.processedMints.size}`);
+      }
+
+      // Trim tokenTradeHistory — remove entries older than 1 hour
+      for (const [mint, trades] of this.tokenTradeHistory) {
+        if (trades.length > 0 && trades[trades.length - 1].timestamp * 1000 < oneHourAgo) {
+          this.tokenTradeHistory.delete(mint);
+        }
+      }
+
+      // Trim wsTokenCache — remove entries older than 1 hour
+      for (const [mint, data] of this.wsTokenCache) {
+        if (data.timestamp < oneHourAgo) {
+          this.wsTokenCache.delete(mint);
+        }
+      }
+    }, 10 * 60 * 1000); // every 10 minutes
   }
 
   getStats() {

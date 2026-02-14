@@ -12,6 +12,8 @@ export interface TokenInfo {
   isRenounced: boolean;
   isMintable: boolean;
   lpBurned: boolean;
+  creator?: string;
+  freezeAuthority?: string | null;
 }
 
 export interface TradeSignal {
@@ -32,6 +34,7 @@ export interface Position {
   entryTime: number;
   source: TradeSignal['type'];
   currentPrice?: number;
+  highestPrice?: number;
 }
 
 export interface WalletConfig {
