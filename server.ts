@@ -24,6 +24,9 @@ async function main() {
   console.log(`  💰 Balance: ${balanceSol.toFixed(4)} SOL\n`);
   if (balanceSol < 0.01) console.log('  ⚠️  Low balance!\n');
 
+  // Seed cached status so API routes never need RPC calls
+  registry.setCachedStatus(w.publicKey.toBase58(), balanceSol);
+
   // Load persisted state
   const savedConfig = storage.loadConfig();
   if (savedConfig) console.log(`  💾 Config restored (saved: ${new Date(savedConfig.updatedAt).toLocaleString()})`);
@@ -45,11 +48,13 @@ async function main() {
     registry.addClient(ws);
   });
 
-  // Performance polling
+  // Performance polling — also updates cached balance for API
   setInterval(async () => {
     try {
       const bal = await conn.getBalance(w.publicKey);
-      registry.updatePerformance(bal / 1e9);
+      const solBal = bal / 1e9;
+      registry.setCachedStatus(w.publicKey.toBase58(), solBal);
+      registry.updatePerformance(solBal);
     } catch {}
   }, 60000);
 

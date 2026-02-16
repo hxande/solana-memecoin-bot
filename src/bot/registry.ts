@@ -23,6 +23,8 @@ export class ModuleRegistry {
 
   private wsClients = new Set<WebSocket>();
   private startedAt = Date.now();
+  private _cachedBalance = 0;
+  private _walletAddress = '';
 
   constructor() {
     this.positionManager = new PositionManager();
@@ -41,6 +43,15 @@ export class ModuleRegistry {
   }
 
   getUptime() { return Date.now() - this.startedAt; }
+
+  setCachedStatus(walletAddress: string, balanceSol: number) {
+    this._walletAddress = walletAddress;
+    this._cachedBalance = balanceSol;
+  }
+
+  getCachedStatus() {
+    return { wallet: this._walletAddress, balanceSol: this._cachedBalance };
+  }
 
   // ── Module control ──
 
