@@ -48,8 +48,11 @@ async function main() {
     registry.addClient(ws);
   });
 
-  // Performance polling — also updates cached balance for API
+  // Balance polling — only when at least one module is running
   setInterval(async () => {
+    const statuses = registry.getModuleStatuses();
+    const anyRunning = Object.values(statuses).some(Boolean);
+    if (!anyRunning) return;
     try {
       const bal = await conn.getBalance(w.publicKey);
       const solBal = bal / 1e9;

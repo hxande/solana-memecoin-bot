@@ -21,13 +21,8 @@ export default function TradesPage() {
   const [stats, setStats] = useState<any>(null);
 
   useEffect(() => {
-    Promise.all([
-      fetch('/api/trades').then(r => r.json()),
-      fetch('/api/trades/stats').then(r => r.json()),
-    ]).then(([t, s]) => {
-      setTrades((t.trades || []).reverse());
-      setStats(s);
-    });
+    fetch('/api/trades').then(r => r.json()).then(t => setTrades((t.trades || []).reverse()));
+    fetch('/api/trades/stats').then(r => r.json()).then(s => setStats(s));
   }, []);
 
   return (
