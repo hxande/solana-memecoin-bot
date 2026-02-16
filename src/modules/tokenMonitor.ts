@@ -6,11 +6,23 @@ import { sendAlert } from '../core/alerts';
 export class TokenMonitor {
   private minScore = 60;
   private analyzed = new Set<string>();
+  private _running = false;
+  private _timers: NodeJS.Timeout[] = [];
 
   async start() {
+    this._running = true;
     console.log('📊 Token Monitor started');
     this.monitorTrending();
   }
+
+  stop() {
+    this._running = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    console.log('📊 Token Monitor stopped');
+  }
+
+  isRunning() { return this._running; }
 
   private async monitorTrending() {
     const check = async () => {
@@ -31,7 +43,7 @@ export class TokenMonitor {
           }
         }
       } catch (err: any) { console.error(`Monitor error: ${err.message}`); }
-      setTimeout(check, 30000);
+      if (this._running) this._timers.push(setTimeout(check, 30000));
     };
     check();
   }

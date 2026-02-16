@@ -9,6 +9,8 @@ import { WalletConfig, TradeSignal } from '../types';
 export class WalletTracker {
   private jupiter: JupiterSwap;
   private trackedWallets: WalletConfig[];
+  private _running = false;
+  private _timers: NodeJS.Timeout[] = [];
 
   constructor() {
     this.jupiter = new JupiterSwap(connection, wallet);
@@ -22,12 +24,22 @@ export class WalletTracker {
   }
 
   async start() {
+    this._running = true;
     console.log('👀 Wallet Tracker started');
     console.log(`📋 Monitorando ${this.trackedWallets.filter(w => w.enabled).length} wallets`);
     for (const w of this.trackedWallets) {
       if (w.enabled) this.pollWalletTransactions(w);
     }
   }
+
+  stop() {
+    this._running = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    console.log('👀 Wallet Tracker stopped');
+  }
+
+  isRunning() { return this._running; }
 
   private async pollWalletTransactions(config: WalletConfig) {
     let lastSig: string | undefined;
@@ -41,7 +53,7 @@ export class WalletTracker {
           for (const sig of sigs.reverse()) await this.analyzeTransaction(sig.signature, config);
         }
       } catch (err: any) { console.error(`Poll error (${config.label}): ${err.message}`); }
-      setTimeout(poll, 2000);
+      if (this._running) this._timers.push(setTimeout(poll, 2000));
     };
     poll();
   }

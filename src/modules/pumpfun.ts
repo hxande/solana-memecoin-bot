@@ -47,6 +47,9 @@ export class PumpFunModule {
   private wsTokenCache = new Map<string, WSTokenData>();
   private apiWorking = true;
   private positionManager: PositionManager | null = null;
+  private _running = false;
+  private _reconnect = true;
+  private _timers: NodeJS.Timeout[] = [];
 
   private filters = {
     minReplies: 0,
@@ -70,12 +73,29 @@ export class PumpFunModule {
   }
 
   async start() {
+    this._running = true;
+    this._reconnect = true;
     console.log('🟣 Pump.fun Module started');
     await this.testApi();
     this.connectWebSocket();
     if (this.apiWorking) this.startBondingCurveMonitor();
     this.startCleanupTimer();
   }
+
+  stop() {
+    this._running = false;
+    this._reconnect = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+    console.log('🟣 Pump.fun Module stopped');
+  }
+
+  isRunning() { return this._running; }
 
   // ══════════════════════════════
   // Test API
@@ -122,9 +142,12 @@ export class PumpFunModule {
 
     this.ws.on('error', (err) => console.error(`🔌 Pump.fun WS error: ${err.message}`));
     this.ws.on('close', (code) => {
-      console.log(`🔌 Pump.fun WS closed (${code}), reconnecting 5s...`);
+      console.log(`🔌 Pump.fun WS closed (${code})${this._reconnect ? ', reconnecting 5s...' : ''}`);
       this.ws = null;
-      setTimeout(() => this.connectWebSocket(), 5000);
+      if (this._reconnect) {
+        const t = setTimeout(() => this.connectWebSocket(), 5000);
+        this._timers.push(t);
+      }
     });
   }
 
@@ -158,7 +181,7 @@ export class PumpFunModule {
     if (!qc.passed) { console.log(`  ❌ Quick filter: ${qc.reason}`); return; }
 
     console.log(`  ⏳ Waiting 15s for trade data...`);
-    setTimeout(async () => { await this.evaluateToken(mint); }, 15000);
+    if (this._running) this._timers.push(setTimeout(async () => { await this.evaluateToken(mint); }, 15000));
   }
 
   // ══════════════════════════════
@@ -489,7 +512,8 @@ export class PumpFunModule {
 
   private async startBondingCurveMonitor() {
     const check = async () => {
-      if (!this.apiWorking) { setTimeout(check, 30000); return; }
+      if (!this._running) return;
+      if (!this.apiWorking) { this._timers.push(setTimeout(check, 30000)); return; }
       try {
         const res = await axios.get(
           `${PUMP_FUN_API}/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false`,
@@ -511,7 +535,7 @@ export class PumpFunModule {
           console.error(`  ⚠️  BC monitor error: ${err.message}`);
         }
       }
-      setTimeout(check, 20000);
+      if (this._running) this._timers.push(setTimeout(check, 20000));
     };
     check();
   }
@@ -583,7 +607,8 @@ export class PumpFunModule {
   // Memory cleanup
   // ══════════════════════════════
   private startCleanupTimer() {
-    setInterval(() => {
+    const id = setInterval(() => {
+      if (!this._running) { clearInterval(id); return; }
       const oneHourAgo = Date.now() - 60 * 60 * 1000;
 
       // Trim processedMints
@@ -607,6 +632,7 @@ export class PumpFunModule {
         }
       }
     }, 10 * 60 * 1000); // every 10 minutes
+    this._timers.push(id);
   }
 
   getStats() {

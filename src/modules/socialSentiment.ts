@@ -35,6 +35,8 @@ export class SocialSentimentModule {
   private activeNarratives = new Map<string, { keywords: string[]; score: number; startedAt: number }>();
 
   private influencers: InfluencerConfig[];
+  private _running = false;
+  private _timers: NodeJS.Timeout[] = [];
 
   constructor() {
     const saved = storage.loadInfluencers();
@@ -51,11 +53,21 @@ export class SocialSentimentModule {
   }
 
   async start() {
+    this._running = true;
     console.log('📱 Social Sentiment Module started');
     this.startTwitterMonitoring();
     this.startNarrativeDetection();
     this.startTrendAnalysis();
   }
+
+  stop() {
+    this._running = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    console.log('📱 Social Sentiment Module stopped');
+  }
+
+  isRunning() { return this._running; }
 
   private async startTwitterMonitoring() {
     const bearerToken = process.env.TWITTER_BEARER_TOKEN;
@@ -87,7 +99,7 @@ export class SocialSentimentModule {
           if (err.response?.status === 429) await new Promise(r => setTimeout(r, 60000));
         }
       }
-      setTimeout(poll, 30000);
+      if (this._running) this._timers.push(setTimeout(poll, 30000));
     };
     poll();
   }
@@ -114,7 +126,7 @@ export class SocialSentimentModule {
         } catch {}
         await new Promise(r => setTimeout(r, 2000));
       }
-      setTimeout(poll, 60000);
+      if (this._running) this._timers.push(setTimeout(poll, 60000));
     };
     poll();
   }
@@ -122,7 +134,7 @@ export class SocialSentimentModule {
   private async startAlternativeMonitoring() {
     const poll = async () => {
       try { await this.fetchDexScreenerTrending(); } catch {}
-      setTimeout(poll, 30000);
+      if (this._running) this._timers.push(setTimeout(poll, 30000));
     };
     poll();
   }
@@ -203,7 +215,7 @@ export class SocialSentimentModule {
         if (Date.now() - val.startedAt > 6 * 3600000) this.activeNarratives.delete(key);
       }
       storage.saveNarratives(this.activeNarratives);
-      setTimeout(detect, 60000);
+      if (this._running) this._timers.push(setTimeout(detect, 60000));
     };
     detect();
   }
@@ -224,7 +236,7 @@ export class SocialSentimentModule {
           }
         }
       }
-      setTimeout(analyze, 45000);
+      if (this._running) this._timers.push(setTimeout(analyze, 45000));
     };
     analyze();
   }

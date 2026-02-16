@@ -17,6 +17,8 @@ export class SniperModule {
   private pollInterval = 3000;
   private apiErrors = { helius: 0, birdeye: 0 };
   private positionManager: PositionManager | null = null;
+  private _running = false;
+  private _timers: NodeJS.Timeout[] = [];
 
   private filters = {
     minLiquiditySOL: 5, maxTopHolderPct: 30, requireMintRevoked: true,
@@ -33,11 +35,21 @@ export class SniperModule {
   }
 
   async start() {
+    this._running = true;
     console.log('🎯 Sniper Module started (polling mode)');
     await this.validateApis();
     this.pollRaydium();
     this.startCleanupTimer();
   }
+
+  stop() {
+    this._running = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    console.log('🎯 Sniper Module stopped');
+  }
+
+  isRunning() { return this._running; }
 
   // ══════════════════════════════
   // Validate API keys on startup
@@ -94,7 +106,7 @@ export class SniperModule {
       } catch (err: any) {
         console.error(`🎯 Poll error: ${err.message}`);
       }
-      setTimeout(poll, this.pollInterval);
+      if (this._running) this._timers.push(setTimeout(poll, this.pollInterval));
     };
     poll();
   }
@@ -370,7 +382,8 @@ export class SniperModule {
   // Memory cleanup
   // ══════════════════════════════
   private startCleanupTimer() {
-    setInterval(() => {
+    const id = setInterval(() => {
+      if (!this._running) { clearInterval(id); return; }
       // Cap processedSignatures at 10k
       if (this.processedSignatures.size > 10000) {
         const arr = Array.from(this.processedSignatures);
@@ -384,5 +397,6 @@ export class SniperModule {
         console.log(`🎯 Trimmed processedMints: ${arr.length} → ${this.processedMints.size}`);
       }
     }, 10 * 60 * 1000); // every 10 minutes
+    this._timers.push(id);
   }
 }

@@ -10,6 +10,9 @@ import { Position } from '../types';
 export class PositionManager {
   private jupiter: JupiterSwap;
   private positions: Map<string, Position> = new Map();
+  private _running = false;
+  private _timers: NodeJS.Timeout[] = [];
+  private _onPositionUpdate?: (positions: Position[]) => void;
 
   constructor() {
     this.jupiter = new JupiterSwap(connection, wallet);
@@ -24,6 +27,10 @@ export class PositionManager {
     console.log(`📌 Position saved: ${pos.symbol} @ $${pos.entryPrice}`);
   }
 
+  setOnPositionUpdate(cb: (positions: Position[]) => void) {
+    this._onPositionUpdate = cb;
+  }
+
   canOpenPosition(): boolean {
     return this.positions.size < CONFIG.trading.maxPositions;
   }
@@ -33,8 +40,10 @@ export class PositionManager {
   }
 
   async startMonitoring() {
+    this._running = true;
     console.log('📊 Position Manager started');
     const monitor = async () => {
+      if (!this._running) return;
       for (const [mint, pos] of this.positions) {
         try {
           const currentPrice = await this.jupiter.getPrice(mint);
@@ -84,11 +93,22 @@ export class PositionManager {
         }
       }
       // Persist updated prices
-      storage.savePositions(Array.from(this.positions.values()));
-      setTimeout(monitor, 5000);
+      const posArr = Array.from(this.positions.values());
+      storage.savePositions(posArr);
+      if (this._onPositionUpdate) this._onPositionUpdate(posArr);
+      if (this._running) this._timers.push(setTimeout(monitor, 5000));
     };
     monitor();
   }
+
+  stop() {
+    this._running = false;
+    for (const t of this._timers) clearTimeout(t);
+    this._timers = [];
+    console.log('📊 Position Manager stopped');
+  }
+
+  isRunning() { return this._running; }
 
   private async closePosition(mint: string, exitPrice: number, reason: string) {
     const pos = this.positions.get(mint);
